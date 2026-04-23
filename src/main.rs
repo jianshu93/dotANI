@@ -306,45 +306,6 @@ fn main() {
 
         let mut sketch_dist = types::SketchDist::new(&cli_params);
         dist::dist(&mut sketch_dist);
-    } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
-        let path_ref_sketch = search_m.get_one::<PathBuf>("db").cloned().unwrap();
-        let path_query_sketch = search_m.get_one::<PathBuf>("query").cloned().unwrap();
-        let threads = search_m
-            .get_one::<usize>("threads")
-            .copied()
-            .unwrap_or_else(|| default_threads_u8() as usize)
-            .min(u8::MAX as usize) as u8;
-
-        let cli_params = types::CliParams {
-            mode: params::CMD_SEARCH.to_string(),
-            path: PathBuf::new(),
-            path_ref_sketch: path_ref_sketch.clone(),
-            path_query_sketch: path_query_sketch.clone(),
-            out_file: search_m.get_one::<PathBuf>("out").cloned().unwrap(),
-            ksize: 0,
-            sketch_method: String::new(),
-            canonical: true,
-            seed: 0,
-            scaled: 1u64,
-            hv_d: 0,
-            hv_quant_scale: 1.0,
-            ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
-            if_compressed: true,
-            threads,
-            device: String::from("cpu"),
-            if_ull: true,
-            ull_p: 0,
-            ull_out_file: PathBuf::new(),
-            path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
-            path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
-        };
-
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(cli_params.threads as usize)
-            .build_global()
-            .unwrap();
-
-        let _ = cli_params;
     } else {
         unreachable!("clap should ensure we don't get here");
     }
