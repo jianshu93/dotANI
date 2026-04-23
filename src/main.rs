@@ -177,7 +177,6 @@ fn main() {
         .subcommand_required(true)
         .subcommand(sketch_cmd)
         .subcommand(dist_cmd)
-        .subcommand(search_cmd)
         .get_matches();
 
     if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
