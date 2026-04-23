@@ -170,44 +170,6 @@ fn main() {
                 .action(ArgAction::Set),
         );
 
-    let search_cmd = Command::new(params::CMD_SEARCH)
-        .about("Search query sketches against a reference sketch database")
-        .arg(
-            Arg::new("db")
-                .short('d')
-                .long("db")
-                .help("Path to reference sketch database")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("query")
-                .short('q')
-                .long("query")
-                .help("Path to query sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("out")
-                .short('o')
-                .long("out")
-                .help("Output search results file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("threads")
-                .long("threads")
-                .short('T')
-                .help("Number of threads, default all logical cores")
-                .value_parser(value_parser!(usize))
-                .action(ArgAction::Set),
-        );
-
     let matches = Command::new("dotani")
         .version(params::VERSION)
         .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and UltraLogLog, with GPU acceleration")
