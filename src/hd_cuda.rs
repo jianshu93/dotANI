@@ -1,3 +1,4 @@
+#[cfg(test)]
 use {
     crate::hd,
     anyhow::{Result, bail},
@@ -27,6 +28,7 @@ pub struct GpuHdEncodeMetrics {
     pub cuda_hd_d2h_event_ns: u128,
 }
 
+#[cfg(test)]
 pub fn encode_hash_hd_cuda(
     hashes: &[u64],
     hv_d: usize,

@@ -227,6 +227,10 @@ impl CudaDedupStrategy {
     }
 }
 
+pub(crate) fn hash_passes_threshold(hash: u64, threshold: u64) -> bool {
+    threshold == u64::MAX || hash < threshold
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SketchInput {
     pub read_path: PathBuf,
