@@ -61,6 +61,7 @@ pub unsafe fn mm_hash64_avx2(kmer: __m256i) -> __m256i {
 pub struct CliParams {
     pub mode: String,
     pub path: PathBuf,
+    pub manifest: Option<PathBuf>,
     pub path_ref_sketch: PathBuf,
     pub path_query_sketch: PathBuf,
     pub out_file: PathBuf,
@@ -87,6 +88,7 @@ pub struct CliParams {
 
 pub struct SketchParams {
     pub path: PathBuf,
+    pub manifest: Option<PathBuf>,
     pub out_file: PathBuf,
     pub sketch_method: String,
     pub canonical: bool,
@@ -107,6 +109,7 @@ impl Default for SketchParams {
     fn default() -> Self {
         SketchParams {
             path: PathBuf::new(),
+            manifest: None,
             out_file: PathBuf::new(),
             sketch_method: String::from("t1ha2"),
             canonical: true,
@@ -129,6 +132,7 @@ impl SketchParams {
     pub fn new(params: &CliParams) -> SketchParams {
         let mut new_sketch = SketchParams::default();
         new_sketch.path = params.path.clone();
+        new_sketch.manifest = params.manifest.clone();
         new_sketch.out_file = params.out_file.clone();
         new_sketch.sketch_method = params.sketch_method.clone();
         new_sketch.canonical = params.canonical;
@@ -146,6 +150,12 @@ impl SketchParams {
 
         new_sketch
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SketchInput {
+    pub read_path: PathBuf,
+    pub file_id: String,
 }
 
 pub struct Sketch {

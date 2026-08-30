@@ -1,8 +1,8 @@
 use log::info;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
 
-use needletail::{parse_fastx_file, Sequence};
+use needletail::{Sequence, parse_fastx_file};
 use rayon::prelude::*;
 
 use crate::types::*;
@@ -11,15 +11,15 @@ use ultraloglog::UltraLogLog;
 
 #[cfg(target_arch = "x86_64")]
 pub fn sketch(params: SketchParams) {
-    let files = utils::get_fasta_files(&params.path);
-    let n_file = files.len();
+    let inputs = utils::get_sketch_inputs(&params).expect("failed to resolve sketch inputs");
+    let n_file = inputs.len();
 
     info!("Start sketching...");
     let pb = utils::get_progress_bar(n_file);
 
-    let results: Vec<(FileSketch, Option<FileUllSketch>)> = files
+    let results: Vec<(FileSketch, Option<FileUllSketch>)> = inputs
         .par_iter()
-        .map(|file| {
+        .map(|input| {
             let mut sketch = FileSketch {
                 ksize: params.ksize,
                 scaled: params.scaled,
@@ -28,11 +28,12 @@ pub fn sketch(params: SketchParams) {
                 hv_d: params.hv_d,
                 hv_quant_bits: 16u8,
                 hv_norm_2: 0,
-                file_str: file.display().to_string(),
+                file_str: input.file_id.clone(),
                 hv: Vec::<i32>::new(),
             };
 
-            let (kmer_hash_set, ull) = extract_kmer_hash_and_ull(&sketch, params.ull_p);
+            let (kmer_hash_set, ull) =
+                extract_kmer_hash_and_ull(&input.read_path, &sketch, params.ull_p);
 
             let hv = if is_x86_feature_detected!("avx512f") {
                 unsafe { hd::encode_hash_hd_avx512(&kmer_hash_set, &sketch) }
@@ -56,7 +57,7 @@ pub fn sketch(params: SketchParams) {
                     canonical: params.canonical,
                     seed: params.seed,
                     ull_p: params.ull_p,
-                    file_str: file.display().to_string(),
+                    file_str: input.file_id.clone(),
                     ull_state: ull.get_state().to_vec(),
                 })
             } else {
@@ -89,13 +90,16 @@ pub fn sketch(params: SketchParams) {
     }
 }
 
-fn extract_kmer_hash_and_ull(sketch: &FileSketch, ull_p: u32) -> (HashSet<u64>, UltraLogLog) {
+fn extract_kmer_hash_and_ull(
+    read_path: &Path,
+    sketch: &FileSketch,
+    ull_p: u32,
+) -> (HashSet<u64>, UltraLogLog) {
     let ksize = sketch.ksize;
     let threshold = u64::MAX / sketch.scaled;
     let seed = sketch.seed;
 
-    let mut fastx_reader =
-        parse_fastx_file(PathBuf::from(sketch.file_str.clone())).expect("Opening .fna files failed");
+    let mut fastx_reader = parse_fastx_file(read_path).expect("Opening .fna files failed");
 
     let mut hash_set = HashSet::<u64>::new();
     let mut ull = UltraLogLog::new(ull_p).expect("Invalid UltraLogLog precision");
@@ -113,7 +117,6 @@ fn extract_kmer_hash_and_ull(sketch: &FileSketch, ull_p: u32) -> (HashSet<u64>, 
             ull.add(h);
             // dothash tracks all hashed kmers
             hash_set.insert(h);
-
         }
     }
 

@@ -1,8 +1,9 @@
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use anyhow::{Result, anyhow, bail};
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -34,12 +35,156 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
             .map(|f| f.unwrap())
             .collect();
 
+        let mut recursive_files: Vec<_> = glob(path.join("**").join(pattern).to_str().unwrap())
+            .expect("Failed to read glob pattern")
+            .map(|f| f.unwrap())
+            .collect();
+
         all_files.append(&mut files);
+        all_files.append(&mut recursive_files);
     }
 
     all_files.sort();
     all_files.dedup();
     all_files
+}
+
+pub fn get_sketch_inputs(params: &SketchParams) -> Result<Vec<SketchInput>> {
+    if let Some(manifest) = &params.manifest {
+        read_sketch_manifest(manifest)
+    } else {
+        Ok(get_fasta_files(&params.path)
+            .into_iter()
+            .map(|read_path| SketchInput {
+                file_id: read_path.display().to_string(),
+                read_path,
+            })
+            .collect())
+    }
+}
+
+/// Parses a two-column TSV sketch manifest with `read_path` and `file_id` columns.
+///
+/// Row order is preserved and `file_id` values must be unique. `#` comment
+/// lines are ignored and CRLF line endings are accepted. Relative `read_path`
+/// values are interpreted relative to the process working directory, not the
+/// manifest's directory; prefer absolute paths for portable or staged manifests.
+pub fn read_sketch_manifest(path: &Path) -> Result<Vec<SketchInput>> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| anyhow!("failed to read manifest {}: {}", path.display(), e))?;
+
+    if contents.as_bytes().contains(&0) {
+        bail!("manifest {} contains NUL bytes", path.display());
+    }
+
+    let mut lines = contents.lines().enumerate();
+    let (_, header_line) = lines
+        .find(|(_, raw_line)| {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .ok_or_else(|| anyhow!("manifest {} does not contain a header row", path.display()))?;
+    let header_line = header_line.strip_suffix('\r').unwrap_or(header_line);
+    let header: Vec<&str> = header_line.split('\t').collect();
+    let read_path_idx = header
+        .iter()
+        .position(|field| *field == "read_path")
+        .ok_or_else(|| {
+            anyhow!(
+                "manifest {} is missing required read_path column",
+                path.display()
+            )
+        })?;
+    let file_id_idx = header
+        .iter()
+        .position(|field| *field == "file_id")
+        .ok_or_else(|| {
+            anyhow!(
+                "manifest {} is missing required file_id column",
+                path.display()
+            )
+        })?;
+    let header_len = header.len();
+    let mut inputs = Vec::new();
+    let mut seen_file_ids = HashSet::new();
+
+    for (line_idx, raw_line) in lines {
+        let line_no = line_idx + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != header_len {
+            bail!(
+                "manifest {} line {} has {} field(s), expected {}",
+                path.display(),
+                line_no,
+                fields.len(),
+                header_len
+            );
+        }
+
+        let read_path = fields[read_path_idx];
+        let file_id = fields[file_id_idx];
+
+        if read_path.is_empty() {
+            bail!(
+                "manifest {} line {} has empty read_path",
+                path.display(),
+                line_no
+            );
+        }
+        if file_id.is_empty() {
+            bail!(
+                "manifest {} line {} has empty file_id",
+                path.display(),
+                line_no
+            );
+        }
+        if !seen_file_ids.insert(file_id.to_string()) {
+            bail!(
+                "manifest {} line {} duplicates file_id {:?}",
+                path.display(),
+                line_no,
+                file_id
+            );
+        }
+
+        let read_path = PathBuf::from(read_path);
+        if !read_path.exists() {
+            bail!(
+                "manifest {} line {} read_path does not exist: {}",
+                path.display(),
+                line_no,
+                read_path.display()
+            );
+        }
+        if !read_path.is_file() {
+            bail!(
+                "manifest {} line {} read_path is not a file: {}",
+                path.display(),
+                line_no,
+                read_path.display()
+            );
+        }
+
+        inputs.push(SketchInput {
+            read_path,
+            file_id: file_id.to_string(),
+        });
+    }
+
+    if inputs.is_empty() {
+        bail!(
+            "manifest {} contains a header but no data rows",
+            path.display()
+        );
+    }
+
+    Ok(inputs)
 }
 
 pub fn get_progress_bar(n_file: usize) -> ProgressBar {
@@ -115,11 +260,7 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
 
     info!(
         "Dump compressed ULL sketch file to {} with compressed size {:.2} MB (raw {:.2} MB, ratio {:.3}, zstd threads {})",
-        out_filename,
-        compressed_size_mb,
-        raw_size_mb,
-        ratio,
-        n_threads
+        out_filename, compressed_size_mb, raw_size_mb, ratio, n_threads
     );
 }
 
@@ -165,8 +306,8 @@ pub fn dump_ani_file(sketch_dist: &SketchDist) {
         if sketch_dist.file_ani[indices[i]].1 >= sketch_dist.ani_threshold {
             csv_str.push_str(&format!(
                 "{}\t{}\t{:.3}\n",
-                sketch_dist.file_ani[indices[i]].0 .0,
-                sketch_dist.file_ani[indices[i]].0 .1,
+                sketch_dist.file_ani[indices[i]].0.0,
+                sketch_dist.file_ani[indices[i]].0.1,
                 sketch_dist.file_ani[indices[i]].1
             ));
             cnt += 1.0;
@@ -218,5 +359,171 @@ pub fn dump_distribution_to_txt(path: &Path) {
 
     for kv in hist {
         println!("{}\t{}", kv.0, kv.1);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dotani_manifest_test_{}_{}_{}",
+            std::process::id(),
+            name,
+            unique
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn manifest_preserves_row_order_and_ids() {
+        let dir = test_dir("order");
+        let a = dir.join("a.fna");
+        let b = dir.join("b.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(&b, ">b\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!(
+                "# version=1\nread_path\tfile_id\trel_path\n{}\tgenome-b\tb.fna\n{}\tgenome-a\ta.fna\n",
+                b.display(),
+                a.display()
+            ),
+        )
+        .unwrap();
+
+        let inputs = read_sketch_manifest(&manifest).unwrap();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].read_path, b);
+        assert_eq!(inputs[0].file_id, "genome-b");
+        assert_eq!(inputs[1].read_path, a);
+        assert_eq!(inputs[1].file_id, "genome-a");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_parses_crlf_and_skips_interleaved_comments() {
+        let dir = test_dir("crlf");
+        let a = dir.join("a.fna");
+        let b = dir.join("b.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(&b, ">b\nACGT\n").unwrap();
+        let body = format!(
+            "# version=1\r\nread_path\tfile_id\r\n{}\tgenome-b\r\n# staged second\r\n{}\tgenome-a\r\n",
+            b.display(),
+            a.display()
+        );
+        fs::write(&manifest, body).unwrap();
+
+        let inputs = read_sketch_manifest(&manifest).unwrap();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].read_path, b);
+        assert_eq!(inputs[0].file_id, "genome-b");
+        assert_eq!(inputs[1].read_path, a);
+        assert_eq!(inputs[1].file_id, "genome-a");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_file_ids() {
+        let dir = test_dir("duplicate");
+        let a = dir.join("a.fna");
+        let b = dir.join("b.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(&b, ">b\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!(
+                "read_path\tfile_id\n{}\tgenome\n{}\tgenome\n",
+                a.display(),
+                b.display()
+            ),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("duplicate IDs should fail");
+
+        assert!(err.to_string().contains("duplicates file_id"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_malformed_rows() {
+        let dir = test_dir("malformed");
+        let a = dir.join("a.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\textra\n", a.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("malformed rows should fail");
+
+        assert!(err.to_string().contains("expected 2"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_missing_read_paths() {
+        let dir = test_dir("missing");
+        let missing = dir.join("missing.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\n", missing.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("missing read_path should fail");
+
+        assert!(err.to_string().contains("read_path does not exist"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_directory_read_paths() {
+        let dir = test_dir("directory");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\n", dir.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("directory read_path should fail");
+
+        assert!(err.to_string().contains("read_path is not a file"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn path_mode_uses_path_as_file_id() {
+        let dir = test_dir("path_mode");
+        let a = dir.join("a.fna");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        let params = SketchParams {
+            path: dir.clone(),
+            ..SketchParams::default()
+        };
+
+        let inputs = get_sketch_inputs(&params).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].read_path, a);
+        assert_eq!(inputs[0].file_id, a.display().to_string());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

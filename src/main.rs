@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use chrono::Local;
-use clap::{value_parser, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, value_parser};
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 
@@ -48,7 +48,17 @@ fn main() {
                 .short('p')
                 .long("path")
                 .help("Input folder path containing .fna/.fa/.fasta files (gzip/bzip2/xz/zstd compressed files supported, e.g., .fna.gz, .fa.bz2, .fasta.xz, .fna.zst)")
-                .required(true)
+                .required_unless_present("manifest")
+                .conflicts_with("manifest")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("manifest")
+                .long("manifest")
+                .help("Input TSV manifest with read_path and file_id columns; row order is preserved; relative read_path values resolve against the current working directory")
+                .required_unless_present("path")
+                .conflicts_with("path")
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
@@ -189,7 +199,11 @@ fn main() {
 
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
-            path: sketch_m.get_one::<PathBuf>("path").cloned().unwrap(),
+            path: sketch_m
+                .get_one::<PathBuf>("path")
+                .cloned()
+                .unwrap_or_default(),
+            manifest: sketch_m.get_one::<PathBuf>("manifest").cloned(),
             path_ref_sketch: PathBuf::new(),
             path_query_sketch: PathBuf::new(),
             out_file: out_file.clone(),
@@ -227,7 +241,7 @@ fn main() {
         {
             sketch::sketch(sketch_params);
         }
-            } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
+    } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
         let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
         let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
         let threads = dist_m
@@ -239,6 +253,7 @@ fn main() {
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
             path: PathBuf::new(),
+            manifest: None,
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
             out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
