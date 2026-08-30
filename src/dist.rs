@@ -148,12 +148,14 @@ pub fn compute_hv_l2_norm(hv: &[i32]) -> i64 {
 
 #[inline]
 pub fn ull_cardinality_from_state(state: &[u8]) -> f64 {
-    let ull = UltraLogLog::wrap(state.to_vec()).expect("Invalid UltraLogLog state");
-    ull.get_distinct_count_estimate()
+    UltraLogLog::wrap(state.to_vec())
+        .expect("invalid UltraLogLog state")
+        .get_distinct_count_estimate()
 }
 
 #[inline]
 pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
+    assert_eq!(r.len(), q.len());
     r.iter()
         .zip(q.iter())
         .map(|(x, y)| (*x as i64) * (*y as i64))
@@ -162,6 +164,9 @@ pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// The caller must execute this function only when AVX2 is available.
 pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
     assert_eq!(r.len(), q.len());
 
@@ -202,6 +207,9 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+/// # Safety
+///
+/// The caller must execute this function only when AVX-512F is available.
 pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
     assert_eq!(r.len(), q.len());
 
@@ -305,6 +313,61 @@ fn flatten_hv_matrix(filesketch: &[FileSketch]) -> Vec<i32> {
         out.extend_from_slice(&fs.hv);
     }
     out
+}
+
+/// Safety margin added on top of the resident upload and tile-output bytes so
+/// the resident symmetric path leaves room for allocator/scratch variance.
+#[cfg(feature = "cuda")]
+const RESIDENT_SAFETY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Resident symmetric path byte requirements, computed without flattening or
+/// allocating the full host matrix. Returns `(upload_bytes, required_bytes)`
+/// with checked arithmetic, or `None` when any component would overflow
+/// `usize` (treated as resident-path infeasible).
+#[cfg(feature = "cuda")]
+fn resident_matrix_bytes(
+    num_rows: usize,
+    hv_d: usize,
+    num_cards: usize,
+    tile_query: usize,
+    tile_ref: usize,
+) -> Option<(usize, usize)> {
+    let upload_bytes = num_rows
+        .checked_mul(hv_d)?
+        .checked_mul(std::mem::size_of::<i32>())?
+        .checked_add(num_cards.checked_mul(std::mem::size_of::<f64>())?)?;
+    let required_bytes = upload_bytes
+        .checked_add(
+            tile_query
+                .checked_mul(tile_ref)?
+                .checked_mul(std::mem::size_of::<i64>())?,
+        )?
+        .checked_add(RESIDENT_SAFETY_BYTES)?;
+    Some((upload_bytes, required_bytes))
+}
+
+/// Returns the shared resident host matrix when the probed free VRAM strictly
+/// exceeds the required bytes, flattening `source` into `cell` at most once.
+/// `None` means the worker must fall back to the tiled path; the host matrix
+/// is never flattened for infeasible or failed free-memory probes.
+#[cfg(feature = "cuda")]
+fn resident_flat_if_feasible<'a>(
+    free_vram: usize,
+    required_bytes: usize,
+    cell: &'a OnceLock<(Vec<i32>, u128)>,
+    source: &'a [FileSketch],
+) -> Option<&'a [i32]> {
+    if free_vram <= required_bytes {
+        return None;
+    }
+    Some(
+        cell.get_or_init(|| {
+            let start = Instant::now();
+            (flatten_hv_matrix(source), start.elapsed().as_nanos())
+        })
+        .0
+        .as_slice(),
+    )
 }
 
 #[cfg(any(not(feature = "cuda"), test))]
@@ -460,7 +523,10 @@ struct DotTileBatch {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
@@ -474,10 +540,9 @@ struct DotTileBatch {
 #[cfg(feature = "cuda")]
 struct TileBatchResult {
     text: String,
+    tile_dots: Vec<i64>,
     num_hits: usize,
     num_pairs_done: usize,
-    candidate_pairs: usize,
-    prefilter_skipped: usize,
     ani_evals: usize,
     nonpositive_skipped: usize,
     text_bytes: usize,
@@ -487,7 +552,10 @@ struct TileBatchResult {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     postprocess_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
@@ -505,8 +573,6 @@ struct GpuStreamBreakdown {
     jobs: usize,
     pairs: usize,
     hits: usize,
-    candidates: usize,
-    prefilter_skipped: usize,
     ani_evals: usize,
     nonpositive_skipped: usize,
     output_bytes: usize,
@@ -516,7 +582,10 @@ struct GpuStreamBreakdown {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     postprocess_ns: u128,
     gpu_send_blocked_ns: u128,
     postprocess_result_send_blocked_ns: u128,
@@ -530,6 +599,19 @@ struct GpuStreamBreakdown {
     resident_flatten_ns: u128,
     resident_upload_ns: u128,
     resident_upload_bytes: usize,
+    per_gpu: Vec<GpuWorkerStats>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+struct GpuWorkerStats {
+    gpu_id: usize,
+    wall_ns: u128,
+    tile_count: usize,
+    pair_count: usize,
+    gpu_tile_total_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
 }
 
 #[cfg(feature = "cuda")]
@@ -538,8 +620,6 @@ impl GpuStreamBreakdown {
         self.jobs += 1;
         self.pairs += batch.num_pairs_done;
         self.hits += batch.num_hits;
-        self.candidates += batch.candidate_pairs;
-        self.prefilter_skipped += batch.prefilter_skipped;
         self.ani_evals += batch.ani_evals;
         self.nonpositive_skipped += batch.nonpositive_skipped;
         self.output_bytes += batch.text_bytes;
@@ -549,7 +629,10 @@ impl GpuStreamBreakdown {
         self.query_h2d_ns += batch.query_h2d_ns;
         self.ref_h2d_ns += batch.ref_h2d_ns;
         self.compute_d2h_ns += batch.compute_d2h_ns;
+        self.kernel_event_ns += batch.kernel_event_ns;
+        self.d2h_event_ns += batch.d2h_event_ns;
         self.gpu_tile_total_ns += batch.gpu_tile_total_ns;
+        self.tile_dots_alloc_ns += batch.tile_dots_alloc_ns;
         self.postprocess_ns += batch.postprocess_ns;
         self.query_h2d_bytes += batch.query_h2d_bytes;
         self.ref_h2d_bytes += batch.ref_h2d_bytes;
@@ -560,61 +643,10 @@ impl GpuStreamBreakdown {
         self.resident_upload_ns += batch.resident_upload_ns;
         self.resident_upload_bytes += batch.resident_upload_bytes;
     }
-}
 
-/// Safety margin added on top of the resident upload and tile-output bytes so
-/// the resident symmetric path leaves room for allocator/scratch variance.
-#[cfg(feature = "cuda")]
-const RESIDENT_SAFETY_BYTES: usize = 128 * 1024 * 1024;
-
-/// Resident symmetric path byte requirements, computed without flattening or
-/// allocating the full host matrix. Returns `(upload_bytes, required_bytes)`
-/// with checked arithmetic, or `None` when any component would overflow
-/// `usize` (treated as resident-path infeasible).
-#[cfg(feature = "cuda")]
-fn resident_matrix_bytes(
-    num_rows: usize,
-    hv_d: usize,
-    num_cards: usize,
-    tile_query: usize,
-    tile_ref: usize,
-) -> Option<(usize, usize)> {
-    let upload_bytes = num_rows
-        .checked_mul(hv_d)?
-        .checked_mul(std::mem::size_of::<i32>())?
-        .checked_add(num_cards.checked_mul(std::mem::size_of::<f64>())?)?;
-    let required_bytes = upload_bytes
-        .checked_add(
-            tile_query
-                .checked_mul(tile_ref)?
-                .checked_mul(std::mem::size_of::<i64>())?,
-        )?
-        .checked_add(RESIDENT_SAFETY_BYTES)?;
-    Some((upload_bytes, required_bytes))
-}
-
-/// Returns the shared resident host matrix when the probed free VRAM strictly
-/// exceeds the required bytes, flattening `source` into `cell` at most once.
-/// `None` means the worker must fall back to the tiled path; the host matrix
-/// is never flattened for infeasible or failed free-memory probes.
-#[cfg(feature = "cuda")]
-fn resident_flat_if_feasible<'a>(
-    free_vram: usize,
-    required_bytes: usize,
-    cell: &'a OnceLock<(Vec<i32>, u128)>,
-    source: &'a [FileSketch],
-) -> Option<&'a [i32]> {
-    if free_vram <= required_bytes {
-        return None;
+    fn add_worker(&mut self, stats: GpuWorkerStats) {
+        self.per_gpu.push(stats);
     }
-    Some(
-        cell.get_or_init(|| {
-            let start = Instant::now();
-            (flatten_hv_matrix(source), start.elapsed().as_nanos())
-        })
-        .0
-        .as_slice(),
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -626,6 +658,7 @@ fn ns_to_secs(ns: u128) -> f64 {
 #[cfg(feature = "cuda")]
 enum GpuPipelineMessage {
     Batch(anyhow::Result<TileBatchResult>),
+    Worker(GpuWorkerStats),
 }
 
 /// Minimal view of a pipeline result message needed by the shared result-queue
@@ -642,7 +675,7 @@ impl GpuPipelineOutput for GpuPipelineMessage {
     fn output_text(&self) -> Option<&str> {
         match self {
             GpuPipelineMessage::Batch(Ok(batch)) => Some(batch.text.as_str()),
-            GpuPipelineMessage::Batch(Err(_)) => None,
+            GpuPipelineMessage::Batch(Err(_)) | GpuPipelineMessage::Worker(_) => None,
         }
     }
 }
@@ -762,10 +795,9 @@ fn postprocess_dot_tile_batch(
 
     TileBatchResult {
         text,
+        tile_dots: batch.tile_dots,
         num_hits,
         num_pairs_done,
-        candidate_pairs: num_pairs_done,
-        prefilter_skipped: 0,
         ani_evals,
         nonpositive_skipped,
         text_bytes,
@@ -775,7 +807,10 @@ fn postprocess_dot_tile_batch(
         query_h2d_ns: batch.query_h2d_ns,
         ref_h2d_ns: batch.ref_h2d_ns,
         compute_d2h_ns: batch.compute_d2h_ns,
+        kernel_event_ns: batch.kernel_event_ns,
+        d2h_event_ns: batch.d2h_event_ns,
         gpu_tile_total_ns: batch.gpu_tile_total_ns,
+        tile_dots_alloc_ns: batch.tile_dots_alloc_ns,
         postprocess_ns,
         query_h2d_bytes: batch.query_h2d_bytes,
         ref_h2d_bytes: batch.ref_h2d_bytes,
@@ -869,6 +904,8 @@ fn stream_hv_ani_gpu_multi(
     let postprocess_result_send_blocked_ns = Arc::new(AtomicU64::new(0));
     let (work_tx, work_rx) = channel::bounded::<DotTileBatch>(work_queue_capacity);
     let (result_tx, result_rx) = channel::bounded::<GpuPipelineMessage>(result_queue_capacity);
+    let (tile_dots_pool_tx, tile_dots_pool_rx) =
+        channel::bounded::<Vec<i64>>(work_queue_capacity + ng);
 
     std::thread::scope(|scope| -> anyhow::Result<usize> {
         for _ in 0..postprocess_workers {
@@ -928,66 +965,86 @@ fn stream_hv_ani_gpu_multi(
             let next = Arc::clone(&next);
             let cancel = Arc::clone(&cancel);
             let gpu_send_blocked_ns = Arc::clone(&gpu_send_blocked_ns);
-            let resident_lazy = resident_lazy;
+            let tile_dots_pool_rx = tile_dots_pool_rx.clone();
 
             scope.spawn(move || {
-                let worker = || -> anyhow::Result<()> {
-                    let mut gpu = GpuDotExecutor::new(dev_id)?;
-                    let mut resident_upload_ns_pending = 0u128;
-                    let mut resident_upload_bytes_pending = 0usize;
-                    let resident_matrix = if let Some((cell, upload_bytes, required_bytes)) =
-                        resident_lazy
-                    {
-                        match gpu.free_memory_bytes() {
-                            Ok(free_vram) => {
-                                match resident_flat_if_feasible(
-                                    free_vram,
-                                    *required_bytes,
-                                    cell,
-                                    ref_filesketch,
-                                ) {
-                                    Some(flat) => {
-                                        let upload_start = Instant::now();
-                                        match gpu
-                                            .upload_resident_matrix(flat, ref_filesketch.len(), hv_d)
-                                        {
-                                            Ok(matrix) => {
-                                                resident_upload_ns_pending =
-                                                    upload_start.elapsed().as_nanos();
-                                                resident_upload_bytes_pending = *upload_bytes;
-                                                Some(matrix)
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "GPU worker {} resident matrix upload failed, falling back to tiled path: {e:?}",
-                                                    dev_id
-                                                );
-                                                None
+                    let worker = || -> anyhow::Result<()> {
+                        let worker_start = Instant::now();
+                        let mut gpu = GpuDotExecutor::new(dev_id)?;
+                        let mut worker_tile_count = 0usize;
+                        let mut worker_pair_count = 0usize;
+                        let mut worker_gpu_tile_total_ns = 0u128;
+                        let mut worker_kernel_event_ns = 0u128;
+                        let mut worker_d2h_event_ns = 0u128;
+                        let mut resident_upload_ns_pending = 0u128;
+                        let mut resident_upload_bytes_pending = 0usize;
+                        let resident_bundle = if let Some((cell, upload_bytes, required_bytes)) =
+                            resident_lazy
+                        {
+                            match gpu.free_memory_bytes() {
+                                Ok(free_vram) => {
+                                    match resident_flat_if_feasible(
+                                        free_vram,
+                                        *required_bytes,
+                                        cell,
+                                        ref_filesketch,
+                                    ) {
+                                        Some(flat) => {
+                                            let upload_start = Instant::now();
+                                            match gpu.upload_resident_matrix(
+                                                flat,
+                                                ref_filesketch.len(),
+                                                hv_d,
+                                            ) {
+                                                Ok(matrix) => {
+                                                    match gpu.upload_resident_cards(ref_cards) {
+                                                        Ok(cards) => {
+                                                            resident_upload_ns_pending =
+                                                                upload_start.elapsed().as_nanos();
+                                                            resident_upload_bytes_pending =
+                                                                *upload_bytes;
+                                                            Some((matrix, cards))
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "GPU worker {} resident card upload failed, falling back to tiled path: {e:?}",
+                                                                dev_id
+                                                            );
+                                                            None
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "GPU worker {} resident matrix upload failed, falling back to tiled path: {e:?}",
+                                                        dev_id
+                                                    );
+                                                    None
+                                                }
                                             }
                                         }
-                                    }
-                                    None => {
-                                        warn!(
-                                            "GPU worker {} free VRAM insufficient for resident symmetric matrix, falling back to tiled path: free_mb={:.1} required_mb={:.1}",
-                                            dev_id,
-                                            free_vram as f64 / (1024.0 * 1024.0),
-                                            *required_bytes as f64 / (1024.0 * 1024.0)
-                                        );
-                                        None
+                                        None => {
+                                            warn!(
+                                                "GPU worker {} free VRAM insufficient for resident symmetric matrix, falling back to tiled path: free_mb={:.1} required_mb={:.1}",
+                                                dev_id,
+                                                free_vram as f64 / (1024.0 * 1024.0),
+                                                *required_bytes as f64 / (1024.0 * 1024.0)
+                                            );
+                                            None
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    warn!(
+                                        "GPU worker {} failed to query free VRAM, falling back to tiled path: {e:?}",
+                                        dev_id
+                                    );
+                                    None
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    "GPU worker {} failed to query free VRAM, falling back to tiled path: {e:?}",
-                                    dev_id
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
 
                     let mut cached_i0 = usize::MAX;
                     let mut cached_i1 = usize::MAX;
@@ -1015,8 +1072,114 @@ fn stream_hv_ani_gpu_multi(
                         let mut resident_tiles = 0usize;
                         let mut resident_fallback_tiles = 0usize;
 
-                        let mut tile_dots = vec![0i64; nq * nr];
-                        let gpu_timings = if let Some(resident) = resident_matrix.as_ref() {
+                        if output_mode == DistOutputMode::Count {
+                            if let Some((resident, resident_cards)) = resident_bundle.as_ref() {
+                                resident_tiles = 1;
+                                let count_result = gpu.compute_count_tile_symmetric_resident(
+                                    resident,
+                                    resident_cards,
+                                    job.j0,
+                                    nq,
+                                    resident,
+                                    resident_cards,
+                                    job.i0,
+                                    nr,
+                                    ksize,
+                                    ani_threshold,
+                                )?;
+                                let gpu_timings = count_result.timings;
+                                let mut num_hits = count_result.hits;
+                                for pair in &count_result.borderline_pairs {
+                                    let inter_hat =
+                                        pair.dot as f64 / ref_filesketch[pair.ref_index].hv_d as f64;
+                                    let ani = ani_from_intersection_and_cardinalities(
+                                        inter_hat,
+                                        ref_cards[pair.ref_index],
+                                        query_cards[pair.query_index],
+                                        ksize,
+                                    );
+                                    if ani >= ani_threshold {
+                                        num_hits += 1;
+                                    }
+                                }
+
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                worker_tile_count += 1;
+                                worker_pair_count += count_result.pairs;
+                                worker_gpu_tile_total_ns += gpu_timings.total_ns;
+                                worker_kernel_event_ns += gpu_timings.kernel_event_ns;
+                                worker_d2h_event_ns += gpu_timings.d2h_event_ns;
+
+                                let result = TileBatchResult {
+                                    text: String::new(),
+                                    tile_dots: Vec::new(),
+                                    num_hits,
+                                    num_pairs_done: count_result.pairs,
+                                    ani_evals: count_result.ani_evals,
+                                    nonpositive_skipped: count_result.nonpositive_skipped,
+                                    text_bytes: 0,
+                                    ref_flatten_events: 0,
+                                    flatten_ref_ns: 0,
+                                    flatten_query_ns: 0,
+                                    query_h2d_ns: gpu_timings.query_h2d_ns,
+                                    ref_h2d_ns: gpu_timings.ref_h2d_ns,
+                                    compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                                    kernel_event_ns: gpu_timings.kernel_event_ns,
+                                    d2h_event_ns: gpu_timings.d2h_event_ns,
+                                    gpu_tile_total_ns: gpu_timings.total_ns,
+                                    tile_dots_alloc_ns: 0,
+                                    postprocess_ns: 0,
+                                    query_h2d_bytes: gpu_timings.query_h2d_bytes,
+                                    ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
+                                    out_d2h_bytes: gpu_timings.out_d2h_bytes,
+                                    ref_uploads: usize::from(gpu_timings.ref_upload_performed),
+                                    resident_tiles,
+                                    resident_fallback_tiles,
+                                    resident_upload_ns: std::mem::take(
+                                        &mut resident_upload_ns_pending,
+                                    ),
+                                    resident_upload_bytes: std::mem::take(
+                                        &mut resident_upload_bytes_pending,
+                                    ),
+                                };
+
+                                let send_start = Instant::now();
+                                match result_tx.send(GpuPipelineMessage::Batch(Ok(result))) {
+                                    Ok(()) => {
+                                        let blocked_ns = send_start.elapsed().as_nanos();
+                                        gpu_send_blocked_ns.fetch_add(
+                                            blocked_ns.min(u64::MAX as u128) as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    Err(_) if cancel.load(Ordering::Relaxed) => break,
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
+                                            "result queue closed unexpectedly: {e}"
+                                        ));
+                                    }
+                                }
+
+                                continue;
+                            }
+                        }
+
+                        let tile_dots_alloc_start = Instant::now();
+                        let tile_len = nq * nr;
+                        let mut tile_dots = match tile_dots_pool_rx.try_recv() {
+                            Ok(mut tile_dots) => {
+                                tile_dots.resize(tile_len, 0);
+                                tile_dots
+                            }
+                            Err(_) => vec![0i64; tile_len],
+                        };
+                        let tile_dots_alloc_ns = tile_dots_alloc_start.elapsed().as_nanos();
+                        let gpu_timings = if let Some((resident, _resident_cards)) =
+                            resident_bundle.as_ref()
+                        {
                             resident_tiles = 1;
                             gpu.compute_tile_resident(
                                 resident,
@@ -1073,6 +1236,11 @@ fn stream_hv_ani_gpu_multi(
                         } else {
                             nq * nr
                         };
+                        worker_tile_count += 1;
+                        worker_pair_count += num_pairs_done;
+                        worker_gpu_tile_total_ns += gpu_timings.total_ns;
+                        worker_kernel_event_ns += gpu_timings.kernel_event_ns;
+                        worker_d2h_event_ns += gpu_timings.d2h_event_ns;
 
                         let batch = DotTileBatch {
                             job,
@@ -1085,7 +1253,10 @@ fn stream_hv_ani_gpu_multi(
                             query_h2d_ns: gpu_timings.query_h2d_ns,
                             ref_h2d_ns: gpu_timings.ref_h2d_ns,
                             compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                            kernel_event_ns: gpu_timings.kernel_event_ns,
+                            d2h_event_ns: gpu_timings.d2h_event_ns,
                             gpu_tile_total_ns: gpu_timings.total_ns,
+                            tile_dots_alloc_ns,
                             query_h2d_bytes: gpu_timings.query_h2d_bytes,
                             ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
                             out_d2h_bytes: gpu_timings.out_d2h_bytes,
@@ -1116,6 +1287,16 @@ fn stream_hv_ani_gpu_multi(
                         }
                     }
 
+                    let stats = GpuWorkerStats {
+                        gpu_id: dev_id,
+                        wall_ns: worker_start.elapsed().as_nanos(),
+                        tile_count: worker_tile_count,
+                        pair_count: worker_pair_count,
+                        gpu_tile_total_ns: worker_gpu_tile_total_ns,
+                        kernel_event_ns: worker_kernel_event_ns,
+                        d2h_event_ns: worker_d2h_event_ns,
+                    };
+                    let _ = result_tx.send(GpuPipelineMessage::Worker(stats));
                     Ok(())
                 };
 
@@ -1145,8 +1326,15 @@ fn stream_hv_ani_gpu_multi(
                         total_hits += batch.num_hits;
                         pb.inc(batch.num_pairs_done as u64);
                         breakdown.add_batch(&batch);
+                        let tile_dots = batch.tile_dots;
+                        if !tile_dots.is_empty() {
+                            let _ = tile_dots_pool_tx.try_send(tile_dots);
+                        }
                     }
                     GpuPipelineMessage::Batch(Err(e)) => return Some(e),
+                    GpuPipelineMessage::Worker(stats) => {
+                        breakdown.add_worker(stats);
+                    }
                 }
                 None
             });
@@ -1182,17 +1370,34 @@ fn stream_hv_ani_gpu_multi(
             } else {
                 "fallback"
             };
-            info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s",
+            breakdown.per_gpu.sort_by_key(|stats| stats.gpu_id);
+            let per_gpu = breakdown
+                .per_gpu
+                .iter()
+                .map(|stats| {
+                    format!(
+                        "{}:{:.3}s:{}:{}:{:.3}s:{:.3}s:{:.3}s",
+                        stats.gpu_id,
+                        ns_to_secs(stats.wall_ns),
+                        stats.tile_count,
+                        stats.pair_count,
+                        ns_to_secs(stats.gpu_tile_total_ns),
+                        ns_to_secs(stats.kernel_event_ns),
+                        ns_to_secs(stats.d2h_event_ns)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            debug!(
+                "gpu stream breakdown: jobs={} pairs={} hits={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} max_postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s kernel_cuda_event={:.3}s d2h_cuda_event={:.3}s tile_dots_alloc={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s gpu_pipeline_wall={:.3}s per_gpu=gid:gpu_pipeline_wall:tiles:pairs:gpu_tile_total:kernel_cuda_event:d2h_cuda_event[{}]",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
-                breakdown.candidates,
-                breakdown.prefilter_skipped,
                 breakdown.ani_evals,
                 breakdown.nonpositive_skipped,
                 resident_mode,
                 postprocess_workers,
+                MAX_POSTPROCESS_WORKERS,
                 breakdown.output_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.ref_flatten_events,
                 breakdown.ref_uploads,
@@ -1207,12 +1412,16 @@ fn stream_hv_ani_gpu_multi(
                 ns_to_secs(breakdown.query_h2d_ns),
                 ns_to_secs(breakdown.ref_h2d_ns),
                 ns_to_secs(breakdown.compute_d2h_ns),
+                ns_to_secs(breakdown.kernel_event_ns),
+                ns_to_secs(breakdown.d2h_event_ns),
+                ns_to_secs(breakdown.tile_dots_alloc_ns),
                 ns_to_secs(breakdown.gpu_tile_total_ns),
                 ns_to_secs(breakdown.gpu_send_blocked_ns),
                 ns_to_secs(breakdown.postprocess_ns),
                 ns_to_secs(breakdown.postprocess_result_send_blocked_ns),
                 ns_to_secs(breakdown.write_ns),
                 stream_wall_start.elapsed().as_secs_f64(),
+                per_gpu,
             );
             Ok(total_hits)
         }
@@ -1242,6 +1451,7 @@ fn write_count_summary(
     writer.flush().context("failed to flush count output")?;
     Ok(())
 }
+
 pub fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
     ref_filesketch: &[FileSketch],
