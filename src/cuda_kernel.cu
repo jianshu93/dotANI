@@ -26,6 +26,52 @@ extern "C" __global__ void cuda_test_wyrng_at_chunk(const uint64_t *hashes,
   }
 }
 
+extern "C" __global__ void
+cuda_hd_encode_counts_direct(const uint64_t *hashes, int num_hashes, int hv_d,
+                             int32_t *hv) {
+  int chunk = blockIdx.x;
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+  int hash_idx = blockIdx.y * blockDim.x + tid;
+
+  __shared__ int warp_counts[8][64];
+
+  for (int i = tid; i < num_warps * 64; i += blockDim.x) {
+    warp_counts[i / 64][i % 64] = 0;
+  }
+  __syncthreads();
+
+  uint64_t rnd = 0;
+  bool active = false;
+  if (hash_idx < num_hashes) {
+    rnd = wyrng_at_chunk(hashes[hash_idx], chunk);
+    active = true;
+  }
+
+  for (int bit = 0; bit < 64; bit++) {
+    unsigned int bit_mask =
+        __ballot_sync(0xffffffff, active && ((rnd >> bit) & 1ULL));
+    if (lane == 0) {
+      warp_counts[warp][bit] = __popc(bit_mask);
+    }
+  }
+
+  __syncthreads();
+
+  if (tid < 64) {
+    int d = chunk * 64 + tid;
+    if (d < hv_d) {
+      int ones = 0;
+      for (int w = 0; w < num_warps; w++) {
+        ones += warp_counts[w][tid];
+      }
+      atomicAdd(&hv[d], ones * 2);
+    }
+  }
+}
+
 extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   key = ~key + (key << 21);
   key = key ^ key >> 24;

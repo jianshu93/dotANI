@@ -9,6 +9,8 @@ pub mod utils;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_dot;
+#[cfg(feature = "cuda")]
+pub mod hd_cuda;
 
 #[cfg(test)]
 mod tests {
@@ -160,6 +162,90 @@ mod tests {
             dist::compute_hv_l2_norm(&first),
             dist::compute_hv_l2_norm(&second)
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_hd_test_module() -> (
+        std::sync::Arc<cudarc::driver::CudaContext>,
+        std::sync::Arc<cudarc::driver::CudaModule>,
+    ) {
+        use cudarc::{driver::CudaContext, nvrtc::Ptx};
+
+        let ctx = CudaContext::new(0).unwrap();
+        let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_PTX)).unwrap();
+        (ctx, module)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_cuda_hd_matches_cpu(input_hashes: &[u64], hv_d: usize) {
+        use crate::hd_cuda;
+
+        let sketch = sketch_for_hv(hv_d);
+        let hash_set: HashSet<u64> = input_hashes.iter().copied().collect();
+        assert_eq!(
+            hash_set.len(),
+            input_hashes.len(),
+            "CUDA HD parity helper expects unique input hashes"
+        );
+
+        let cpu_hv = hd::encode_hash_hd(&hash_set, &sketch);
+        let (ctx, module) = cuda_hd_test_module();
+        let (gpu_hv, _metrics) =
+            hd_cuda::encode_hash_hd_cuda(input_hashes, hv_d, &ctx, &module).unwrap();
+
+        assert_eq!(cpu_hv, gpu_hv);
+        assert_eq!(
+            dist::compute_hv_l2_norm(&cpu_hv),
+            dist::compute_hv_l2_norm(&gpu_hv)
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_hd_encode_matches_cpu_edge_cases() {
+        assert_cuda_hd_matches_cpu(&[], 1024);
+        assert_cuda_hd_matches_cpu(&[0x1234_5678_9abc_def0], 1024);
+        assert_cuda_hd_matches_cpu(&[0], 1024);
+        assert_cuda_hd_matches_cpu(&[0], 4096);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_hd_encode_matches_cpu_representative_hash_sets() {
+        let fixed: Vec<u64> = fixed_hashes().into_iter().collect();
+        assert_cuda_hd_matches_cpu(&fixed, 1024);
+        assert_cuda_hd_matches_cpu(&fixed, 4096);
+
+        let mut rng = WyRng::seed_from_u64(0x5eed_cafe_dead_beef);
+        let mut larger = HashSet::with_capacity(10_000);
+        while larger.len() < 10_000 {
+            larger.insert(rng.next_u64());
+        }
+        let larger: Vec<u64> = larger.into_iter().collect();
+        assert_cuda_hd_matches_cpu(&larger, 1024);
+        assert_cuda_hd_matches_cpu(&larger, 4096);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_hd_metrics_follow_gpu_work_applicability() {
+        use crate::hd_cuda;
+
+        let (ctx, module) = cuda_hd_test_module();
+
+        let (_empty_hv, empty_metrics) =
+            hd_cuda::encode_hash_hd_cuda(&[], 4096, &ctx, &module).unwrap();
+        assert_eq!(empty_metrics, hd_cuda::GpuHdEncodeMetrics::default());
+
+        assert!(hd_cuda::encode_hash_hd_cuda(&[0x1234_5678_9abc_def0], 63, &ctx, &module).is_err());
+
+        let (_normal_hv, normal_metrics) =
+            hd_cuda::encode_hash_hd_cuda(&[0x1234_5678_9abc_def0], 4096, &ctx, &module).unwrap();
+        assert!(normal_metrics.cuda_hd_alloc_ns > 0);
+        assert!(normal_metrics.cuda_hd_hash_h2d_ns > 0);
+        assert!(normal_metrics.cuda_hd_hv_h2d_ns > 0);
+        assert!(normal_metrics.cuda_hd_kernel_launch_ns > 0);
+        assert!(normal_metrics.cuda_hd_d2h_ns > 0);
     }
 
     #[test]

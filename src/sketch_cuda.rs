@@ -2,7 +2,7 @@ use crate::types::*;
 
 #[cfg(feature = "cuda")]
 use {
-    crate::{dist, fastx_reader, hd, utils},
+    crate::{dist, fastx_reader, hd, hd_cuda, utils},
     cudarc::{
         driver::{CudaContext, LaunchConfig, PushKernelArg},
         nvrtc::Ptx,
@@ -112,15 +112,18 @@ pub fn sketch_cuda(params: SketchParams) {
             metrics.cuda_filter_ns = Some(hash_and_dedup_ns);
             metrics.unique_hashes = sampled_hash_set.len();
 
+            let sampled_hashes: Vec<u64> = sampled_hash_set.iter().copied().collect();
             let start = Instant::now();
-            let hv = if is_x86_feature_detected!("avx512f") {
-                unsafe { hd::encode_hash_hd_avx512(&sampled_hash_set, &sketch) }
-            } else if is_x86_feature_detected!("avx2") {
-                unsafe { hd::encode_hash_hd_avx2(&sampled_hash_set, &sketch) }
-            } else {
-                hd::encode_hash_hd(&sampled_hash_set, &sketch)
-            };
+            let (hv, hd_metrics) =
+                hd_cuda::encode_hash_hd_cuda(&sampled_hashes, sketch.hv_d, &ctx, &module).unwrap();
             metrics.hd_encode_ns = start.elapsed().as_nanos();
+            if !sampled_hashes.is_empty() && sketch.hv_d >= 64 {
+                metrics.cuda_hd_hash_h2d_ns = Some(hd_metrics.cuda_hd_hash_h2d_ns);
+                metrics.cuda_hd_hv_h2d_ns = Some(hd_metrics.cuda_hd_hv_h2d_ns);
+                metrics.cuda_hd_alloc_ns = Some(hd_metrics.cuda_hd_alloc_ns);
+                metrics.cuda_hd_kernel_launch_ns = Some(hd_metrics.cuda_hd_kernel_launch_ns);
+                metrics.cuda_hd_d2h_ns = Some(hd_metrics.cuda_hd_d2h_ns);
+            }
 
             let start = Instant::now();
             sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);

@@ -177,6 +177,11 @@ pub struct FileSketchMetrics {
     pub cuda_d2h_ns: Option<u128>,
     pub cuda_zero_filter_ns: Option<u128>,
     pub cuda_filter_ns: Option<u128>,
+    pub cuda_hd_hash_h2d_ns: Option<u128>,
+    pub cuda_hd_hv_h2d_ns: Option<u128>,
+    pub cuda_hd_alloc_ns: Option<u128>,
+    pub cuda_hd_kernel_launch_ns: Option<u128>,
+    pub cuda_hd_d2h_ns: Option<u128>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
