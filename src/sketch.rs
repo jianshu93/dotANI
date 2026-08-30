@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, anyhow, bail};
 use log::info;
 use std::collections::HashSet;
 use std::path::Path;
@@ -11,9 +12,10 @@ use crate::{dist, hd, utils};
 use ultraloglog::UltraLogLog;
 
 #[cfg(target_arch = "x86_64")]
-pub fn sketch(params: SketchParams) {
+pub fn sketch(params: SketchParams) -> Result<()> {
+    utils::validate_sketch_params(&params)?;
     let sketch_wall_start = Instant::now();
-    let inputs = utils::get_sketch_inputs(&params).expect("failed to resolve sketch inputs");
+    let inputs = utils::get_sketch_inputs(&params)?;
     let n_file = inputs.len();
 
     info!("Start sketching...");
@@ -36,7 +38,7 @@ pub fn sketch(params: SketchParams) {
             };
 
             let (kmer_hash_set, ull, mut metrics) =
-                extract_kmer_hash_and_ull(&input.read_path, &sketch, params.ull_p);
+                extract_kmer_hash_and_ull(&input.read_path, &sketch, params.ull_p)?;
             metrics.file = sketch.file_str.clone();
             metrics.unique_hashes = kmer_hash_set.len();
 
@@ -56,7 +58,7 @@ pub fn sketch(params: SketchParams) {
 
             let start = Instant::now();
             if params.if_compressed {
-                sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
+                sketch.hv_quant_bits = hd::compress_hd_sketch(&mut sketch, &hv)?;
             } else {
                 sketch.hv = hv.clone();
             }
@@ -80,9 +82,9 @@ pub fn sketch(params: SketchParams) {
 
             metrics.total_worker_ns = worker_start.elapsed().as_nanos();
 
-            (sketch, ull_record, metrics)
+            Ok((sketch, ull_record, metrics))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     pb.finish_and_clear();
 
@@ -98,37 +100,47 @@ pub fn sketch(params: SketchParams) {
         pb.per_sec()
     );
 
-    utils::dump_sketch(&all_filesketch, &params.out_file);
+    utils::dump_sketch(&all_filesketch, &params.out_file)?;
 
     if params.if_ull {
-        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file);
+        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file)?;
     }
 
     if let Some(prefix) = &params.metrics_out {
-        utils::dump_sketch_metrics(&all_metrics, prefix, sketch_wall_start.elapsed().as_nanos());
+        utils::dump_sketch_metrics(&all_metrics, prefix, sketch_wall_start.elapsed().as_nanos())?;
     }
+
+    Ok(())
 }
 
 fn extract_kmer_hash_and_ull(
     read_path: &Path,
     sketch: &FileSketch,
     ull_p: u32,
-) -> (HashSet<u64>, UltraLogLog, FileSketchMetrics) {
+) -> Result<(HashSet<u64>, UltraLogLog, FileSketchMetrics)> {
     let ksize = sketch.ksize;
     let threshold = u64::MAX / sketch.scaled;
     let seed = sketch.seed;
     let mut metrics = FileSketchMetrics::default();
 
     let start = Instant::now();
-    let mut fastx_reader = parse_fastx_file(read_path).expect("Opening .fna files failed");
+    let mut fastx_reader = parse_fastx_file(read_path)
+        .map_err(|e| anyhow!("failed to open FASTA/FASTQ {}: {e}", read_path.display()))?;
     metrics.fasta_ns = start.elapsed().as_nanos();
 
     let mut hash_set = HashSet::<u64>::new();
-    let mut ull = UltraLogLog::new(ull_p).expect("Invalid UltraLogLog precision");
+    let mut ull = UltraLogLog::new(ull_p)
+        .map_err(|e| anyhow!("invalid UltraLogLog precision {ull_p}: {e}"))?;
+    let mut valid_kmers = 0usize;
 
     while let Some(record) = fastx_reader.next() {
         let start = Instant::now();
-        let seqrec: needletail::parser::SequenceRecord<'_> = record.expect("invalid record");
+        let seqrec: needletail::parser::SequenceRecord<'_> = record.with_context(|| {
+            format!(
+                "failed to parse FASTA/FASTQ record in {}",
+                read_path.display()
+            )
+        })?;
 
         let norm_seq = seqrec.normalize(false);
         metrics.input_bases += norm_seq.len();
@@ -143,6 +155,7 @@ fn extract_kmer_hash_and_ull(
                 // ULL tracks the full hashed k-mer stream
                 ull.add(h);
                 metrics.hashes_seen += 1;
+                valid_kmers += 1;
                 // dothash tracks all hashed kmers
                 hash_set.insert(h);
             }
@@ -159,6 +172,7 @@ fn extract_kmer_hash_and_ull(
                 // ULL tracks the full hashed k-mer stream
                 ull.add(h);
                 metrics.hashes_seen += 1;
+                valid_kmers += 1;
                 // dothash tracks all hashed kmers
                 hash_set.insert(h);
             }
@@ -166,5 +180,13 @@ fn extract_kmer_hash_and_ull(
         metrics.hash_and_dedup_ns += start.elapsed().as_nanos();
     }
 
-    (hash_set, ull, metrics)
+    if valid_kmers == 0 {
+        bail!(
+            "input file {} produced no valid {}-mers",
+            read_path.display(),
+            ksize
+        );
+    }
+
+    Ok((hash_set, ull, metrics))
 }

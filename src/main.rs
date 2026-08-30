@@ -1,10 +1,10 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Result, anyhow, bail};
 use chrono::Local;
 use clap::{Arg, ArgAction, Command, value_parser};
-use env_logger::{Builder, Target};
-use log::LevelFilter;
+use env_logger::{Builder, Env, Target};
 
 #[cfg(feature = "cuda")]
 use dotani::sketch_cuda;
@@ -21,13 +21,30 @@ fn init_log() {
                 record.args()
             )
         })
-        .filter(None, LevelFilter::Info)
+        .parse_env(Env::default().default_filter_or("info"))
         .target(Target::Stdout)
         .init();
 }
 
 fn ull_path_from_sketch_path(p: &PathBuf) -> PathBuf {
     PathBuf::from(format!("{}.ull", p.to_string_lossy()))
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn main() {
+    init_log();
+    println!("\n ************** initializing logger *****************\n");
+    log::info!("\nLogger initialized\n");
+
+    if let Err(error) = run() {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -40,32 +57,48 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-fn default_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
-fn default_sketch_device() -> String {
-    if cuda_enabled() {
-        String::from("cuda")
-    } else {
-        String::from("cpu")
+fn parse_ksize(value: &str) -> Result<u8, String> {
+    let parsed = value
+        .parse::<u8>()
+        .map_err(|_| format!("{value:?} is not a valid k-mer size"))?;
+    if parsed == 0 {
+        return Err("ksize must be greater than zero".to_string());
     }
+    Ok(parsed)
 }
 
-fn cuda_enabled() -> bool {
-    cfg!(feature = "cuda")
+fn parse_ull_p(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{value:?} is not a valid ULL precision"))?;
+    if !(3..=26).contains(&parsed) {
+        return Err("ULL precision must be in 3..=26".to_string());
+    }
+    Ok(parsed)
 }
 
-fn main() {
-    init_log();
-    println!("\n ************** initializing logger *****************\n");
-    log::info!("\nLogger initialized\n");
+fn parse_hv_d(value: &str) -> Result<usize, String> {
+    let parsed = parse_positive_usize(value)?;
+    if parsed % 256 != 0 {
+        return Err("hv_d must be divisible by 256".to_string());
+    }
+    Ok(parsed)
+}
 
+fn parse_ani_threshold(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("{value:?} is not a valid ANI threshold"))?;
+    if !parsed.is_finite() || !(0.0..=100.0).contains(&parsed) {
+        return Err("ANI threshold must be finite and in 0..=100".to_string());
+    }
+    Ok(parsed)
+}
+
+fn run() -> Result<()> {
     let sketch_cmd = Command::new(params::CMD_SKETCH)
         .version("0.3.0")
-        .about("Sketch genome FASTA files into DotHash and UltraLogLog sketches")
+        .about("Sketch genome FASTA files into DotHash and ULL or ELL sketches")
         .arg(
             Arg::new("path")
                 .short('p')
@@ -83,6 +116,76 @@ fn main() {
                 .required_unless_present("path")
                 .conflicts_with("path")
                 .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .help("Output DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(parse_positive_usize)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("canonical")
+                .short('C')
+                .long("canonical")
+                .help("Whether to use canonical k-mers")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ksize")
+                .short('k')
+                .long("ksize")
+                .help("k-mer size for sketching")
+                .default_value("16")
+                .value_parser(parse_ksize)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("seed")
+                .short('S')
+                .long("seed")
+                .help("Hash seed")
+                .default_value("1447")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull_p")
+                .long("ull-p")
+                .help("UltraLogLog precision parameter")
+                .default_value("14")
+                .value_parser(parse_ull_p)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("hv_d")
+                .short('d')
+                .long("hv-d")
+                .help("Dimension for hypervector")
+                .default_value("4096")
+                .value_parser(parse_hv_d)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("quant_scale")
+                .short('Q')
+                .long("quant-scale")
+                .help("Scaling factor for HV quantization")
+                .default_value("1.0")
+                .value_parser(value_parser!(f32))
                 .action(ArgAction::Set),
         )
         .arg(
@@ -112,76 +215,6 @@ fn main() {
                 .long("max-readers")
                 .help("CUDA only: maximum concurrent FASTA read/decompress/merge workers")
                 .value_parser(parse_positive_usize)
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("out")
-                .short('o')
-                .long("out")
-                .help("Output DotHash sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("threads")
-                .long("threads")
-                .short('T')
-                .help("Number of threads, default all logical cores")
-                .value_parser(value_parser!(usize))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("canonical")
-                .short('C')
-                .long("canonical")
-                .help("Whether to use canonical k-mers")
-                .default_value("true")
-                .value_parser(value_parser!(bool))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("ksize")
-                .short('k')
-                .long("ksize")
-                .help("k-mer size for sketching")
-                .default_value("16")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("seed")
-                .short('S')
-                .long("seed")
-                .help("Hash seed")
-                .default_value("1447")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("ull_p")
-                .long("ull-p")
-                .help("UltraLogLog precision parameter")
-                .default_value("14")
-                .value_parser(value_parser!(u32))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("hv_d")
-                .short('d')
-                .long("hv-d")
-                .help("Dimension for hypervector")
-                .default_value("4096")
-                .value_parser(value_parser!(usize))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("quant_scale")
-                .short('Q')
-                .long("quant-scale")
-                .help("Scaling factor for HV quantization")
-                .default_value("1.0")
-                .value_parser(value_parser!(f32))
                 .action(ArgAction::Set),
         );
 
@@ -218,8 +251,8 @@ fn main() {
             Arg::new("threads")
                 .long("threads")
                 .short('T')
-                .help("Number of threads, default all logical cores")
-                .value_parser(value_parser!(usize))
+                .help("Number of threads, default all logical cores; distance postprocessing uses one worker at -T1 and at most 128 workers")
+                .value_parser(parse_positive_usize)
                 .action(ArgAction::Set),
         )
         .arg(
@@ -228,13 +261,13 @@ fn main() {
                 .long("ani-th")
                 .help("ANI threshold")
                 .default_value("85.0")
-                .value_parser(value_parser!(f32))
+                .value_parser(parse_ani_threshold)
                 .action(ArgAction::Set),
         );
 
     let matches = Command::new("dotani")
         .version(params::VERSION)
-        .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and UltraLogLog, with GPU acceleration")
+        .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and ULL or ELL, with GPU acceleration")
         .arg_required_else_help(true)
         .subcommand_required(true)
         .subcommand(sketch_cmd)
@@ -242,24 +275,25 @@ fn main() {
         .get_matches();
 
     if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
-        let out_file = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
+        let out_file = sketch_m
+            .get_one::<PathBuf>("out")
+            .cloned()
+            .expect("clap guarantees --out is required");
         let threads = sketch_m
             .get_one::<usize>("threads")
             .copied()
             .unwrap_or_else(default_threads);
-
         let device = sketch_m
             .get_one::<String>("device")
             .cloned()
             .unwrap_or_else(default_sketch_device);
+        let max_readers = sketch_m.get_one::<usize>("max_readers").copied();
 
         if device == "cuda" && !cuda_enabled() {
-            eprintln!("error: --device cuda requires a binary built with --features cuda");
-            std::process::exit(2);
+            bail!("--device cuda requires a binary built with --features cuda");
         }
-        if device == "cpu" && sketch_m.contains_id("max_readers") {
-            eprintln!("error: --max-readers is only supported with --device cuda");
-            std::process::exit(2);
+        if device == "cpu" && max_readers.is_some() {
+            bail!("--max-readers is only supported with --device cuda");
         }
 
         let cli_params = types::CliParams {
@@ -272,13 +306,23 @@ fn main() {
             path_ref_sketch: PathBuf::new(),
             path_query_sketch: PathBuf::new(),
             out_file: out_file.clone(),
-            ksize: *sketch_m.get_one::<u8>("ksize").unwrap(),
+            ksize: *sketch_m
+                .get_one::<u8>("ksize")
+                .expect("clap guarantees ksize has default"),
             sketch_method: String::from("t1ha2"),
-            canonical: *sketch_m.get_one::<bool>("canonical").unwrap(),
-            seed: *sketch_m.get_one::<u64>("seed").unwrap(),
+            canonical: *sketch_m
+                .get_one::<bool>("canonical")
+                .expect("clap guarantees canonical has default"),
+            seed: *sketch_m
+                .get_one::<u64>("seed")
+                .expect("clap guarantees seed has default"),
             scaled: 1u64,
-            hv_d: *sketch_m.get_one::<usize>("hv_d").unwrap(),
-            hv_quant_scale: *sketch_m.get_one::<f32>("quant_scale").unwrap(),
+            hv_d: *sketch_m
+                .get_one::<usize>("hv_d")
+                .expect("clap guarantees hv-d has default"),
+            hv_quant_scale: *sketch_m
+                .get_one::<f32>("quant_scale")
+                .expect("clap guarantees quant-scale has default"),
             ani_threshold: 0.0,
             if_compressed: true,
             threads,
@@ -287,40 +331,50 @@ fn main() {
                     .get_one::<String>("cuda_dedup")
                     .expect("clap guarantees cuda-dedup has default"),
             ),
-            max_readers: sketch_m.get_one::<usize>("max_readers").copied(),
+            max_readers,
             device,
             if_ull: true,
-            ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
+            ull_p: *sketch_m
+                .get_one::<u32>("ull_p")
+                .expect("clap guarantees ull-p has default"),
             ull_out_file: ull_path_from_sketch_path(&out_file),
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
         };
 
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(cli_params.threads as usize)
-            .build_global()
-            .unwrap();
-
         let sketch_params = types::SketchParams::new(&cli_params);
 
-        if sketch_params.device == "cuda" {
+        let sketch_result = if sketch_params.device == "cuda" {
             #[cfg(feature = "cuda")]
             {
-                sketch_cuda::sketch_cuda(sketch_params);
+                sketch_cuda::sketch_cuda(sketch_params)
             }
-
             #[cfg(not(feature = "cuda"))]
             {
-                eprintln!("error: --device cuda requires a binary built with --features cuda");
-                std::process::exit(2);
+                return Err(anyhow!(
+                    "--device cuda requires a binary built with --features cuda"
+                ));
             }
         } else {
-            sketch::sketch(sketch_params);
-        }
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(cli_params.threads)
+                .build_global()
+                .map_err(|e| anyhow!("failed to configure Rayon thread pool: {e}"))?;
+
+            sketch::sketch(sketch_params)
+        };
+
+        sketch_result?;
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
-        let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
-        let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
+        let path_ref_sketch = dist_m
+            .get_one::<PathBuf>("path_r")
+            .cloned()
+            .expect("clap guarantees --path-r is required");
+        let path_query_sketch = dist_m
+            .get_one::<PathBuf>("path_q")
+            .cloned()
+            .expect("clap guarantees --path-q is required");
         let threads = dist_m
             .get_one::<usize>("threads")
             .copied()
@@ -332,7 +386,10 @@ fn main() {
             manifest: None,
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
-            out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
+            out_file: dist_m
+                .get_one::<PathBuf>("out")
+                .cloned()
+                .expect("clap guarantees --out is required"),
             ksize: 0,
             sketch_method: String::new(),
             canonical: true,
@@ -340,7 +397,9 @@ fn main() {
             scaled: 1u64,
             hv_d: 0,
             hv_quant_scale: 1.0,
-            ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
+            ani_threshold: *dist_m
+                .get_one::<f32>("ani_th")
+                .expect("clap guarantees ani-th has default"),
             if_compressed: true,
             threads,
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
@@ -355,13 +414,27 @@ fn main() {
         };
 
         rayon::ThreadPoolBuilder::new()
-            .num_threads(cli_params.threads as usize)
+            .num_threads(cli_params.threads)
             .build_global()
-            .unwrap();
+            .map_err(|e| anyhow!("failed to configure Rayon thread pool: {e}"))?;
 
         let mut sketch_dist = types::SketchDist::new(&cli_params);
-        dist::dist(&mut sketch_dist);
+        dist::dist(&mut sketch_dist)?;
     } else {
-        unreachable!("clap should ensure we don't get here");
+        bail!("no supported subcommand was selected");
     }
+
+    Ok(())
+}
+
+fn default_sketch_device() -> String {
+    if cuda_enabled() {
+        String::from("cuda")
+    } else {
+        String::from("cpu")
+    }
+}
+
+fn cuda_enabled() -> bool {
+    cfg!(feature = "cuda")
 }

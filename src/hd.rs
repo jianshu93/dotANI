@@ -18,6 +18,7 @@ use std::arch::x86_64::*;
 /// Math:
 /// - hv starts at -N for every coordinate
 /// - each seed contributes +2 when the corresponding random bit is 1
+///
 /// So final coordinate = (#ones * 2) - N.
 pub(crate) fn validate_hv_dimension(hv_d: usize) -> Result<()> {
     if hv_d == 0 {
@@ -30,6 +31,8 @@ pub(crate) fn validate_hv_dimension(hv_d: usize) -> Result<()> {
 }
 
 pub fn encode_hash_hd(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i32> {
+    assert!(sketch.hv_d != 0 && sketch.hv_d.is_multiple_of(256));
+    assert!(kmer_hash_set.len() <= i32::MAX as usize);
     let hv_d = sketch.hv_d;
     let seed_vec = Vec::from_iter(kmer_hash_set.clone());
     let mut hv = vec![-(kmer_hash_set.len() as i32); hv_d];
@@ -51,7 +54,12 @@ pub fn encode_hash_hd(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// The caller must execute this function only when AVX2 is available.
 pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i32> {
+    assert!(sketch.hv_d != 0 && sketch.hv_d.is_multiple_of(256));
+    assert!(kmer_hash_set.len() <= i32::MAX as usize);
     let hv_d = sketch.hv_d;
     let num_seed = kmer_hash_set.len();
 
@@ -114,7 +122,12 @@ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSke
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+/// # Safety
+///
+/// The caller must execute this function only when AVX-512F is available.
 pub unsafe fn encode_hash_hd_avx512(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i32> {
+    assert!(sketch.hv_d != 0 && sketch.hv_d.is_multiple_of(256));
+    assert!(kmer_hash_set.len() <= i32::MAX as usize);
     let hv_d = sketch.hv_d;
     let num_seed = kmer_hash_set.len();
 
@@ -192,12 +205,27 @@ pub unsafe fn encode_hash_hd_avx512(kmer_hash_set: &HashSet<u64>, sketch: &FileS
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i32>) -> u8 {
+pub fn compress_hd_sketch(sketch: &mut FileSketch, hv: &[i32]) -> Result<u8> {
+    validate_hv_dimension(sketch.hv_d)?;
+    if hv.len() != sketch.hv_d {
+        bail!(
+            "HD vector length {} does not match hv_d {}",
+            hv.len(),
+            sketch.hv_d
+        );
+    }
     let hv_d = sketch.hv_d;
 
-    let min_hv = *hv.iter().min().unwrap();
-    let max_hv = *hv.iter().max().unwrap();
+    let min_hv = hv
+        .iter()
+        .min()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("HD vector is empty"))?;
+    let max_hv = hv
+        .iter()
+        .max()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("HD vector is empty"))?;
 
     let mut quant_bit: u8 = 6;
     loop {
@@ -230,9 +258,11 @@ pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i32>) -> u8 {
             );
         }
 
-        sketch
-            .hv
-            .clone_from(&hv_compress_bits[..].align_to::<i32>().1.to_vec());
+        let packed = hv_compress_bits
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|bytes| i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        sketch.hv.clone_from(&packed);
     } else {
         let total_bits = quant_bit as usize * hv_d;
         let len_bit_vec_u32 = total_bits.div_ceil(32);
@@ -251,24 +281,53 @@ pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i32>) -> u8 {
         sketch.hv.clone_from(&hv_compress_bits);
     }
 
-    quant_bit
+    Ok(quant_bit)
 }
 
-pub fn decompress_file_sketch(file_sketch: &mut Vec<FileSketch>) {
+pub fn decompress_file_sketch(file_sketch: &mut [FileSketch]) -> Result<()> {
+    if file_sketch.is_empty() {
+        bail!("HD sketch collection is empty");
+    }
     let hv_dim = file_sketch[0].hv_d;
     info!("Decompressing sketch with HV dim={}", hv_dim);
 
-    file_sketch.par_iter_mut().for_each(|sketch| {
-        let hv_decompressed = unsafe { decompress_hd_sketch(sketch) };
-        sketch.hv.clone_from(&hv_decompressed);
-    });
+    file_sketch.par_iter_mut().try_for_each(|sketch| {
+        let hv_decompressed = decompress_hd_sketch(sketch)?;
+        sketch.hv = hv_decompressed;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i32> {
+pub fn decompress_hd_sketch(sketch: &mut FileSketch) -> Result<Vec<i32>> {
+    validate_hv_dimension(sketch.hv_d)?;
     let hv_d = sketch.hv_d;
     let quant_bit = sketch.hv_quant_bits;
+
+    if quant_bit == 0 {
+        if sketch.hv.len() != hv_d {
+            bail!(
+                "raw HD vector length {} does not match hv_d {}",
+                sketch.hv.len(),
+                hv_d
+            );
+        }
+        return Ok(sketch.hv.clone());
+    }
+    if !(6..=32).contains(&quant_bit) {
+        bail!("invalid HD quantization bit width {quant_bit}");
+    }
+    let expected_len = hv_d
+        .checked_mul(quant_bit as usize)
+        .and_then(|bits| bits.checked_div(32))
+        .ok_or_else(|| anyhow::anyhow!("compressed HD vector length overflows"))?;
+    if sketch.hv.len() != expected_len {
+        bail!(
+            "compressed HD vector length {} does not match expected {}",
+            sketch.hv.len(),
+            expected_len
+        );
+    }
 
     let mut hv_decompressed: Vec<i32> = vec![0; hv_d];
 
@@ -276,7 +335,11 @@ pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i32> {
         let bitpacker = BitPacker8x::new();
         let bits_per_block = quant_bit as usize * 32;
 
-        let hv_u8 = sketch.hv.align_to::<u8>().1.to_vec();
+        let hv_u8 = sketch
+            .hv
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>();
         let mut hv_u32: Vec<u32> = vec![0; hv_d];
 
         for i in 0..(hv_d / BitPacker8x::BLOCK_LEN) {
@@ -307,5 +370,5 @@ pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i32> {
         }
     }
 
-    hv_decompressed
+    Ok(hv_decompressed)
 }

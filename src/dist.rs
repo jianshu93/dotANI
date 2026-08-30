@@ -4,37 +4,49 @@ use crate::hd;
 use crate::types::*;
 use crate::utils;
 
+use anyhow::{Result, bail};
 use log::{info, warn};
 use rayon::prelude::*;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
-use crate::cuda_dot::{device_count, GpuDotExecutor};
+use crate::cuda_dot::{GpuDotExecutor, device_count};
 
-pub fn dist(sketch_dist: &mut SketchDist) {
+pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
+    if !sketch_dist.ani_threshold.is_finite() || !(0.0..=100.0).contains(&sketch_dist.ani_threshold)
+    {
+        bail!("ANI threshold must be finite and in 0..=100");
+    }
+    if sketch_dist.threads == 0 {
+        bail!("distance thread count must be greater than zero");
+    }
+    if sketch_dist.out_file.as_os_str().is_empty() {
+        bail!("ANI output path must not be empty");
+    }
+
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
-    let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path());
+    let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path())?;
     let query_ull_sketch = if if_sym {
         ref_ull_sketch.clone()
     } else {
-        utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())
+        utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())?
     };
 
-    let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path());
+    let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path())?;
     let mut query_file_sketch = if if_sym {
         ref_file_sketch.clone()
     } else {
-        utils::load_sketch(sketch_dist.path_query_sketch.as_path())
+        utils::load_sketch(sketch_dist.path_query_sketch.as_path())?
     };
 
     assert_eq!(
@@ -50,15 +62,13 @@ pub fn dist(sketch_dist: &mut SketchDist) {
 
     for i in 0..ref_file_sketch.len() {
         assert_eq!(
-            ref_file_sketch[i].file_str,
-            ref_ull_sketch[i].file_str,
+            ref_file_sketch[i].file_str, ref_ull_sketch[i].file_str,
             "Ref HD/ULL file order mismatch"
         );
     }
     for i in 0..query_file_sketch.len() {
         assert_eq!(
-            query_file_sketch[i].file_str,
-            query_ull_sketch[i].file_str,
+            query_file_sketch[i].file_str, query_ull_sketch[i].file_str,
             "Query HD/ULL file order mismatch"
         );
     }
@@ -77,8 +87,8 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         "Ref and query sketches use different HV dimensions!"
     );
 
-    hd::decompress_file_sketch(&mut ref_file_sketch);
-    hd::decompress_file_sketch(&mut query_file_sketch);
+    hd::decompress_file_sketch(&mut ref_file_sketch)?;
+    hd::decompress_file_sketch(&mut query_file_sketch)?;
 
     compute_hv_ani(
         sketch_dist,
@@ -88,7 +98,7 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         &query_ull_sketch,
         ksize_ref,
         if_sym,
-    );
+    )?;
 
     info!(
         "Computed ANIs for {} ref files and {} query files took {:.3}s",
@@ -96,6 +106,8 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         query_file_sketch.len(),
         tstart.elapsed().as_secs_f32()
     );
+
+    Ok(())
 }
 
 pub fn compute_hv_l2_norm(hv: &[i32]) -> i64 {
@@ -232,6 +244,7 @@ pub fn ani_from_intersection_and_cardinalities(
 }
 
 #[inline]
+#[cfg(any(not(feature = "cuda"), test))]
 fn compute_pairwise_dot_best(r: &[i32], q: &[i32]) -> i64 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -260,6 +273,7 @@ fn flatten_hv_matrix(filesketch: &[FileSketch]) -> Vec<i32> {
     out
 }
 
+#[cfg(any(not(feature = "cuda"), test))]
 fn stream_hv_ani_cpu(
     out_path: &std::path::Path,
     pb: &indicatif::ProgressBar,
@@ -557,7 +571,7 @@ pub fn compute_hv_ani(
     query_ull_sketch: &[FileUllSketch],
     ksize: u8,
     if_symmetric: bool,
-) {
+) -> Result<()> {
     info!("Computing ANI..");
 
     let num_ref_files = ref_filesketch.len();
@@ -592,7 +606,7 @@ pub fn compute_hv_ani(
                 .expect("Failed to create ANI output file");
             let mut writer = BufWriter::new(out_file);
 
-            match stream_hv_ani_gpu_multi(
+            let n = stream_hv_ani_gpu_multi(
                 &mut writer,
                 &pb,
                 ref_filesketch,
@@ -602,28 +616,10 @@ pub fn compute_hv_ani(
                 ksize,
                 if_symmetric,
                 sketch_dist.ani_threshold,
-            ) {
-                Ok(n) => {
-                    writer.flush().expect("Failed to flush ANI output");
-                    info!("Multi-GPU tiled dot-product completed successfully");
-                    n
-                }
-                Err(e) => {
-                    warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
-                    drop(writer);
-                    stream_hv_ani_cpu(
-                        sketch_dist.out_file.as_path(),
-                        &pb,
-                        ref_filesketch,
-                        query_filesketch,
-                        &ref_cards,
-                        &query_cards,
-                        ksize,
-                        if_symmetric,
-                        sketch_dist.ani_threshold,
-                    )
-                }
-            }
+            )?;
+            writer.flush().expect("Failed to flush ANI output");
+            info!("Multi-GPU tiled dot-product completed successfully");
+            n
         }
 
         #[cfg(not(feature = "cuda"))]
@@ -666,4 +662,6 @@ pub fn compute_hv_ani(
             sketch_dist.out_file.to_string_lossy()
         );
     }
+
+    Ok(())
 }

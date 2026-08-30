@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{info, warn};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -10,7 +11,14 @@ use std::path::{Path, PathBuf};
 
 use crate::{hd, types::*};
 
-pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
+pub fn get_fasta_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        bail!("input directory does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        bail!("input path is not a directory: {}", path.display());
+    }
+
     let mut all_files = Vec::new();
 
     for pattern in [
@@ -30,15 +38,17 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
         "*.fa.zst",
         "*.fasta.zst",
     ] {
-        let mut files: Vec<_> = glob(path.join(pattern).to_str().unwrap())
-            .expect("Failed to read glob pattern")
-            .map(|f| f.unwrap())
-            .collect();
+        let direct_pattern = path.join(pattern).to_string_lossy().into_owned();
+        let recursive_pattern = path.join("**").join(pattern).to_string_lossy().into_owned();
+        let mut files = glob(&direct_pattern)
+            .map_err(|e| anyhow!("failed to read FASTA glob pattern {direct_pattern:?}: {e}"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("failed to inspect FASTA path: {e}"))?;
 
-        let mut recursive_files: Vec<_> = glob(path.join("**").join(pattern).to_str().unwrap())
-            .expect("Failed to read glob pattern")
-            .map(|f| f.unwrap())
-            .collect();
+        let mut recursive_files = glob(&recursive_pattern)
+            .map_err(|e| anyhow!("failed to read FASTA glob pattern {recursive_pattern:?}: {e}"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("failed to inspect FASTA path: {e}"))?;
 
         all_files.append(&mut files);
         all_files.append(&mut recursive_files);
@@ -46,21 +56,68 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
 
     all_files.sort();
     all_files.dedup();
-    all_files
+    if all_files.is_empty() {
+        bail!(
+            "input directory {} contains no supported FASTA files",
+            path.display()
+        );
+    }
+
+    Ok(all_files)
 }
 
 pub fn get_sketch_inputs(params: &SketchParams) -> Result<Vec<SketchInput>> {
     if let Some(manifest) = &params.manifest {
         read_sketch_manifest(manifest)
     } else {
-        Ok(get_fasta_files(&params.path)
-            .into_iter()
-            .map(|read_path| SketchInput {
-                file_id: read_path.display().to_string(),
-                read_path,
-            })
-            .collect())
+        get_fasta_files(&params.path).map(|files| {
+            files
+                .into_iter()
+                .map(|read_path| SketchInput {
+                    file_id: read_path.display().to_string(),
+                    read_path,
+                })
+                .collect()
+        })
     }
+}
+
+pub(crate) fn validate_sketch_params(params: &SketchParams) -> Result<()> {
+    if params.ksize == 0 {
+        bail!("ksize must be greater than zero");
+    }
+    if params.scaled == 0 {
+        bail!("scaled must be greater than zero");
+    }
+    if params.threads == 0 {
+        bail!("thread count must be greater than zero");
+    }
+    if params.max_readers == Some(0) {
+        bail!("max_readers must be greater than zero");
+    }
+    if params.device != "cpu" && params.device != "cuda" {
+        bail!("unsupported sketch device {:?}", params.device);
+    }
+    if params.device == "cuda" && params.ksize > 32 {
+        bail!(
+            "CUDA sketching supports ksize up to 32 (found {})",
+            params.ksize
+        );
+    }
+    hd::validate_hv_dimension(params.hv_d)?;
+    if !(3..=26).contains(&params.ull_p) {
+        bail!("ULL precision must be in 3..=26 (found {})", params.ull_p);
+    }
+    if params.out_file.as_os_str().is_empty() {
+        bail!("sketch output path must not be empty");
+    }
+    if params.manifest.is_some() && !params.path.as_os_str().is_empty() {
+        bail!("path and manifest inputs are mutually exclusive");
+    }
+    if params.manifest.is_none() && params.path.as_os_str().is_empty() {
+        bail!("either an input directory or manifest is required");
+    }
+    Ok(())
 }
 
 /// Parses a two-column TSV sketch manifest with `read_path` and `file_id` columns.
@@ -191,38 +248,47 @@ pub fn get_progress_bar(n_file: usize) -> ProgressBar {
     let pb = ProgressBar::new(n_file as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{wide_bar} {pos}/{len} ({percent}%) - Elapsed: {elapsed_precise}, ETA: {eta_precise}",
-            )
-            .unwrap(),
+            .template("{wide_bar} {pos}/{len} ({percent}%) - Elapsed: {elapsed_precise}, ETA: {eta_precise}")
+            .expect("progress bar template must be valid"),
     );
-
     pb
 }
 
-pub fn dump_sketch(file_sketch: &Vec<FileSketch>, out_file_path: &PathBuf) {
-    let out_filename = out_file_path.to_str().unwrap();
-
-    let serialized = bincode::serialize::<Vec<FileSketch>>(file_sketch).unwrap();
-    fs::write(out_filename, &serialized).expect("Dump sketch file failed!");
+pub fn dump_sketch(file_sketch: &[FileSketch], out_file_path: &Path) -> Result<()> {
+    let serialized = bincode::serialize(file_sketch).context("failed to serialize HD sketches")?;
+    fs::write(out_file_path, &serialized)
+        .with_context(|| format!("failed to write sketch file {}", out_file_path.display()))?;
 
     let sketch_size_mb = serialized.len() as f32 / 1024.0 / 1024.0;
     info!(
         "Dump sketch file to {} with size {:.2} MB",
-        out_filename, sketch_size_mb
+        out_file_path.display(),
+        sketch_size_mb
     );
+    Ok(())
 }
 
-pub fn load_sketch(path: &Path) -> Vec<FileSketch> {
-    info!("Loading sketch from {}", path.to_str().unwrap());
-    let serialized = fs::read(path).expect("Opening sketch file failed!");
-    bincode::deserialize::<Vec<FileSketch>>(&serialized[..]).unwrap()
+pub fn load_sketch(path: &Path) -> Result<Vec<FileSketch>> {
+    info!("Loading sketch from {}", path.display());
+    let serialized =
+        fs::read(path).with_context(|| format!("failed to read sketch file {}", path.display()))?;
+    let sketches = bincode::deserialize::<Vec<FileSketch>>(&serialized)
+        .with_context(|| format!("failed to decode sketch file {}", path.display()))?;
+    validate_file_sketches(&sketches, &format!("HD sketch file {}", path.display()))?;
+    Ok(sketches)
 }
 
-pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &PathBuf) {
-    let out_filename = out_file_path.to_str().unwrap();
+pub fn dump_ull_sketch(file_ull_sketch: &[FileUllSketch], out_file_path: &Path) -> Result<()> {
+    dump_compressed_cardinality_sketch(file_ull_sketch, out_file_path, "ULL")
+}
 
-    let serialized = bincode::serialize::<Vec<FileUllSketch>>(file_ull_sketch).unwrap();
+fn dump_compressed_cardinality_sketch<T: Serialize>(
+    records: &[T],
+    out_file_path: &Path,
+    format: &str,
+) -> Result<()> {
+    let serialized = bincode::serialize(records)
+        .with_context(|| format!("failed to serialize {format} sketches"))?;
 
     let n_threads = if serialized.len() < 8 * 1024 * 1024 {
         1
@@ -233,22 +299,29 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
             .min(32)
     };
 
-    let mut encoder =
-        zstd::stream::Encoder::new(Vec::new(), 3).expect("Failed to create zstd encoder");
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)
+        .with_context(|| format!("failed to create {format} zstd encoder"))?;
 
     if n_threads > 1 {
         encoder
             .multithread(n_threads as u32)
-            .expect("Failed to enable zstd multithreading");
+            .with_context(|| format!("failed to enable {format} zstd multithreading"))?;
     }
 
     encoder
         .write_all(serialized.as_slice())
-        .expect("Failed to write ULL bytes into zstd encoder");
+        .with_context(|| format!("failed to write {format} bytes into zstd encoder"))?;
 
-    let compressed = encoder.finish().expect("Failed to finalize zstd encoding");
+    let compressed = encoder
+        .finish()
+        .with_context(|| format!("failed to finalize {format} zstd encoding"))?;
 
-    fs::write(out_filename, &compressed).expect("Dump ULL sketch file failed!");
+    fs::write(out_file_path, &compressed).with_context(|| {
+        format!(
+            "failed to write {format} sketch file {}",
+            out_file_path.display()
+        )
+    })?;
 
     let raw_size_mb = serialized.len() as f32 / 1024.0 / 1024.0;
     let compressed_size_mb = compressed.len() as f32 / 1024.0 / 1024.0;
@@ -259,9 +332,14 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
     };
 
     info!(
-        "Dump compressed ULL sketch file to {} with compressed size {:.2} MB (raw {:.2} MB, ratio {:.3}, zstd threads {})",
-        out_filename, compressed_size_mb, raw_size_mb, ratio, n_threads
+        "Dump compressed {format} sketch file to {} with compressed size {:.2} MB (raw {:.2} MB, ratio {:.3}, zstd threads {})",
+        out_file_path.display(),
+        compressed_size_mb,
+        raw_size_mb,
+        ratio,
+        n_threads
     );
+    Ok(())
 }
 
 pub fn dump_sketch_metrics(
@@ -359,6 +437,133 @@ pub fn dump_sketch_metrics(
     Ok(())
 }
 
+pub(crate) fn validate_file_sketches(sketches: &[FileSketch], label: &str) -> Result<()> {
+    if sketches.is_empty() {
+        bail!("{label} collection is empty");
+    }
+
+    let first = &sketches[0];
+    validate_file_sketch(first, &format!("{label} record 0"))?;
+
+    for (index, sketch) in sketches.iter().enumerate().skip(1) {
+        validate_file_sketch(sketch, &format!("{label} record {index}"))?;
+        for (field, expected, actual) in [
+            ("ksize", first.ksize as u64, sketch.ksize as u64),
+            ("scaled", first.scaled, sketch.scaled),
+            ("seed", first.seed, sketch.seed),
+            ("hv_d", first.hv_d as u64, sketch.hv_d as u64),
+        ] {
+            if expected != actual {
+                bail!(
+                    "{label} record {index} has incompatible {field}: expected {expected}, found {actual}"
+                );
+            }
+        }
+        if first.canonical != sketch.canonical {
+            bail!(
+                "{label} record {index} has incompatible canonical flag: expected {}, found {}",
+                first.canonical,
+                sketch.canonical
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_file_sketch(sketch: &FileSketch, label: &str) -> Result<()> {
+    if sketch.file_str.is_empty() {
+        bail!("{label} has an empty file identifier");
+    }
+    if sketch.ksize == 0 {
+        bail!("{label} has invalid ksize 0");
+    }
+    if sketch.scaled == 0 {
+        bail!("{label} has invalid scaled value 0");
+    }
+    hd::validate_hv_dimension(sketch.hv_d).map_err(|e| anyhow!("{label} has invalid hv_d: {e}"))?;
+    if sketch.hv_norm_2 < 0 {
+        bail!("{label} has negative hv_norm_2 {}", sketch.hv_norm_2);
+    }
+
+    if sketch.hv_quant_bits == 0 {
+        if sketch.hv.len() != sketch.hv_d {
+            bail!(
+                "{label} raw vector length {} does not match hv_d {}",
+                sketch.hv.len(),
+                sketch.hv_d
+            );
+        }
+        return Ok(());
+    }
+
+    if !(6..=32).contains(&sketch.hv_quant_bits) {
+        bail!(
+            "{label} has invalid quantization bit width {}",
+            sketch.hv_quant_bits
+        );
+    }
+    let expected_len = sketch
+        .hv_d
+        .checked_mul(sketch.hv_quant_bits as usize)
+        .and_then(|bits| bits.checked_div(32))
+        .ok_or_else(|| anyhow!("{label} compressed vector length overflows"))?;
+    if sketch.hv.len() != expected_len {
+        bail!(
+            "{label} compressed vector length {} does not match hv_d {} and quantization bits {} (expected {})",
+            sketch.hv.len(),
+            sketch.hv_d,
+            sketch.hv_quant_bits,
+            expected_len
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_ull_sketches(sketches: &[FileUllSketch], label: &str) -> Result<()> {
+    if sketches.is_empty() {
+        bail!("{label} collection is empty");
+    }
+
+    let first = &sketches[0];
+    validate_ull_sketch(first, &format!("{label} record 0"))?;
+    for (index, sketch) in sketches.iter().enumerate().skip(1) {
+        validate_ull_sketch(sketch, &format!("{label} record {index}"))?;
+        if sketch.ksize != first.ksize
+            || sketch.canonical != first.canonical
+            || sketch.seed != first.seed
+            || sketch.ull_p != first.ull_p
+        {
+            bail!("{label} record {index} has inconsistent ksize, canonical, seed, or ull_p");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_ull_sketch(sketch: &FileUllSketch, label: &str) -> Result<()> {
+    if sketch.file_str.is_empty() {
+        bail!("{label} has an empty file identifier");
+    }
+    if sketch.ksize == 0 {
+        bail!("{label} has invalid ksize 0");
+    }
+    if !(3..=26).contains(&sketch.ull_p) {
+        bail!("{label} has invalid ULL precision {}", sketch.ull_p);
+    }
+    let ull = ultraloglog::UltraLogLog::wrap(sketch.ull_state.clone())
+        .map_err(|e| anyhow!("{label} has invalid ULL state: {e}"))?;
+    if ull.get_p() != sketch.ull_p {
+        bail!(
+            "{label} ULL state precision {} does not match metadata {}",
+            ull.get_p(),
+            sketch.ull_p
+        );
+    }
+    Ok(())
+}
+
 fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
     match (left, right) {
         (Some(a), Some(b)) => Some(a + b),
@@ -422,29 +627,32 @@ fn optional_ns(value: Option<u128>) -> String {
         .unwrap_or_else(|| String::from("NA"))
 }
 
-pub fn load_ull_sketch(path: &Path) -> Vec<FileUllSketch> {
-    info!("Loading ULL sketch from {}", path.to_str().unwrap());
-    let bytes = fs::read(path).expect("Opening ULL sketch file failed!");
+pub fn load_ull_sketch(path: &Path) -> Result<Vec<FileUllSketch>> {
+    info!("Loading ULL sketch from {}", path.display());
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read ULL sketch file {}", path.display()))?;
 
     // New format: zstd-compressed bincode
-    if let Ok(serialized) = zstd::stream::decode_all(bytes.as_slice()) {
-        if let Ok(v) = bincode::deserialize::<Vec<FileUllSketch>>(&serialized[..]) {
-            return v;
-        }
+    if let Ok(serialized) = zstd::stream::decode_all(bytes.as_slice())
+        && let Ok(v) = bincode::deserialize::<Vec<FileUllSketch>>(&serialized[..])
+    {
+        validate_ull_sketches(&v, &format!("ULL sketch file {}", path.display()))?;
+        return Ok(v);
     }
 
     // Backward compatibility: old raw bincode format
     if let Ok(v) = bincode::deserialize::<Vec<FileUllSketch>>(&bytes[..]) {
         warn!(
             "ULL sketch file {} is in legacy uncompressed format",
-            path.to_string_lossy()
+            path.display()
         );
-        return v;
+        validate_ull_sketches(&v, &format!("ULL sketch file {}", path.display()))?;
+        return Ok(v);
     }
 
-    panic!(
-        "Failed to load ULL sketch file {} as either zstd-compressed or legacy uncompressed format",
-        path.to_string_lossy()
+    bail!(
+        "failed to decode ULL sketch file {} as zstd-compressed or legacy uncompressed bincode",
+        path.display()
     );
 }
 
@@ -496,9 +704,8 @@ pub fn dump_ani_file(sketch_dist: &SketchDist) {
 }
 
 pub fn dump_distribution_to_txt(path: &Path) {
-    let mut file_sketch = load_sketch(path);
-
-    hd::decompress_file_sketch(&mut file_sketch);
+    let mut file_sketch = load_sketch(path).expect("failed to load HD sketch");
+    hd::decompress_file_sketch(&mut file_sketch).expect("failed to decompress HD sketch");
 
     let data: Vec<Vec<i32>> = (0..file_sketch.len())
         .map(|i| file_sketch[i].hv.clone())
@@ -519,6 +726,7 @@ pub fn dump_distribution_to_txt(path: &Path) {
         println!("{}\t{}", kv.0, kv.1);
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +890,109 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].read_path, a);
         assert_eq!(inputs[0].file_id, a.display().to_string());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn valid_hd(file: &str) -> FileSketch {
+        FileSketch {
+            ksize: 3,
+            scaled: 1,
+            canonical: true,
+            seed: 1447,
+            hv_d: 256,
+            hv_quant_bits: 0,
+            hv_norm_2: 0,
+            file_str: file.to_string(),
+            hv: vec![0; 256],
+        }
+    }
+
+    fn valid_ull(file: &str) -> FileUllSketch {
+        let ull = ultraloglog::UltraLogLog::new(14).unwrap();
+        FileUllSketch {
+            ksize: 3,
+            canonical: true,
+            seed: 1447,
+            ull_p: 14,
+            file_str: file.to_string(),
+            ull_state: ull.get_state().to_vec(),
+        }
+    }
+
+    #[test]
+    fn loaded_sketch_validation_rejects_empty_corrupt_and_inconsistent_records() {
+        let dir = test_dir("loaded_validation");
+        let empty_hd_path = dir.join("empty.sketch");
+        fs::write(
+            &empty_hd_path,
+            bincode::serialize(&Vec::<FileSketch>::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(load_sketch(&empty_hd_path).is_err());
+
+        let mut bad_length = valid_hd("bad-length");
+        bad_length.hv.pop();
+        let bad_length_path = dir.join("bad-length.sketch");
+        fs::write(
+            &bad_length_path,
+            bincode::serialize(&vec![bad_length]).unwrap(),
+        )
+        .unwrap();
+        assert!(load_sketch(&bad_length_path).is_err());
+
+        let mut bad_quantization = valid_hd("bad-quantization");
+        bad_quantization.hv_quant_bits = 5;
+        bad_quantization.hv = vec![0; 40];
+        let bad_quantization_path = dir.join("bad-quantization.sketch");
+        fs::write(
+            &bad_quantization_path,
+            bincode::serialize(&vec![bad_quantization]).unwrap(),
+        )
+        .unwrap();
+        assert!(load_sketch(&bad_quantization_path).is_err());
+
+        let mut inconsistent = valid_hd("second");
+        inconsistent.canonical = false;
+        let inconsistent_path = dir.join("inconsistent.sketch");
+        fs::write(
+            &inconsistent_path,
+            bincode::serialize(&vec![valid_hd("first"), inconsistent]).unwrap(),
+        )
+        .unwrap();
+        assert!(load_sketch(&inconsistent_path).is_err());
+
+        let empty_ull_path = dir.join("empty.ull");
+        fs::write(
+            &empty_ull_path,
+            bincode::serialize(&Vec::<FileUllSketch>::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(load_ull_sketch(&empty_ull_path).is_err());
+
+        let mut bad_state = valid_ull("bad-state");
+        bad_state.ull_state = vec![0];
+        let bad_state_path = dir.join("bad-state.ull");
+        fs::write(
+            &bad_state_path,
+            bincode::serialize(&vec![bad_state]).unwrap(),
+        )
+        .unwrap();
+        assert!(load_ull_sketch(&bad_state_path).is_err());
+
+        let mut inconsistent_ull = valid_ull("second");
+        inconsistent_ull.ull_p = 15;
+        inconsistent_ull.ull_state = ultraloglog::UltraLogLog::new(15)
+            .unwrap()
+            .get_state()
+            .to_vec();
+        let inconsistent_ull_path = dir.join("inconsistent.ull");
+        fs::write(
+            &inconsistent_ull_path,
+            bincode::serialize(&vec![valid_ull("first"), inconsistent_ull]).unwrap(),
+        )
+        .unwrap();
+        assert!(load_ull_sketch(&inconsistent_ull_path).is_err());
+
         fs::remove_dir_all(dir).unwrap();
     }
 }

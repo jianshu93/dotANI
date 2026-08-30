@@ -360,6 +360,7 @@ pub struct SketchDist {
     pub ksize: u8,
     pub hv_d: usize,
     pub ani_threshold: f32,
+    pub threads: usize,
     pub file_ani: Vec<((String, String), f32)>,
 }
 
@@ -374,6 +375,7 @@ impl Default for SketchDist {
             ksize: 21,
             hv_d: 1024,
             ani_threshold: 85.0,
+            threads: 1,
             file_ani: Vec::<((String, String), f32)>::new(),
         }
     }
@@ -390,6 +392,7 @@ impl SketchDist {
         new_dist.ksize = params.ksize;
         new_dist.hv_d = params.hv_d;
         new_dist.ani_threshold = params.ani_threshold;
+        new_dist.threads = params.threads;
         new_dist
     }
 }

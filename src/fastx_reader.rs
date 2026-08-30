@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use needletail::{Sequence, parse_fastx_file};
 use std::path::Path;
@@ -46,28 +47,43 @@ impl Drop for ReaderPermit {
 }
 
 // Read normalized records into one sequence, with N separators only between records.
-pub fn read_merge_seq(file_name: &Path) -> MergedSequence {
+pub fn read_merge_seq(file_name: &Path) -> Result<MergedSequence> {
     let mut fna_seqs = Vec::<u8>::new();
     let mut input_bases = 0usize;
     let mut record_count = 0usize;
 
-    let mut fastx_reader = parse_fastx_file(file_name).expect("Opening FASTA/FASTQ failed");
+    let mut fastx_reader = parse_fastx_file(file_name)
+        .map_err(|e| anyhow!("failed to open FASTA/FASTQ {}: {e}", file_name.display()))?;
     while let Some(record) = fastx_reader.next() {
-        let seqrec = record.expect("invalid record");
+        let seqrec = record.with_context(|| {
+            format!(
+                "failed to parse FASTA/FASTQ record in {}",
+                file_name.display()
+            )
+        })?;
         let norm_seq = seqrec.normalize(false);
 
         if record_count > 0 {
             fna_seqs.push(b'N');
         }
         fna_seqs.extend_from_slice(norm_seq.as_ref());
-        input_bases += norm_seq.len();
+        input_bases = input_bases
+            .checked_add(norm_seq.len())
+            .ok_or_else(|| anyhow!("normalized input length overflows usize"))?;
         record_count += 1;
     }
 
-    MergedSequence {
+    if record_count == 0 {
+        bail!(
+            "FASTA/FASTQ file {} contains no records",
+            file_name.display()
+        );
+    }
+
+    Ok(MergedSequence {
         sequence: fna_seqs,
         input_bases,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -96,10 +112,20 @@ mod tests {
     fn merged_sequence_separates_records_without_counting_synthetic_n() {
         let path = test_file("merged", b">one\nacgt\n>two\ntt\n");
 
-        let merged = read_merge_seq(&path);
+        let merged = read_merge_seq(&path).unwrap();
 
         assert_eq!(merged.sequence, b"ACGTNTT");
         assert_eq!(merged.input_bases, 6);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_fastx_returns_an_error() {
+        let path = test_file("malformed", b"@one\nACGT\n+\n!!\n");
+
+        let error = read_merge_seq(&path).expect_err("malformed FASTQ should fail");
+
+        assert!(error.to_string().contains("parse"));
         fs::remove_file(path).unwrap();
     }
 

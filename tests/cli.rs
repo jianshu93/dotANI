@@ -126,7 +126,7 @@ fn manifest_cli_preserves_row_order_and_file_ids() {
     assert_success(&sketch);
 
     let expected_ids = ["genome-zeta", "genome-alpha"];
-    let hd_sketches = dotani::utils::load_sketch(&sketch_path);
+    let hd_sketches = dotani::utils::load_sketch(&sketch_path).unwrap();
     let hd_ids: Vec<&str> = hd_sketches
         .iter()
         .map(|sketch| sketch.file_str.as_str())
@@ -134,7 +134,7 @@ fn manifest_cli_preserves_row_order_and_file_ids() {
     assert_eq!(hd_ids, expected_ids);
 
     let ull_sidecar = PathBuf::from(format!("{}.ull", sketch_path.display()));
-    let ull_sketches = dotani::utils::load_ull_sketch(&ull_sidecar);
+    let ull_sketches = dotani::utils::load_ull_sketch(&ull_sidecar).unwrap();
     let ull_ids: Vec<&str> = ull_sketches
         .iter()
         .map(|sketch| sketch.file_str.as_str())
@@ -158,13 +158,200 @@ fn manifest_cli_preserves_row_order_and_file_ids() {
     ]);
     assert_success(&path_sketch);
 
-    let path_hd = dotani::utils::load_sketch(&path_sketch_path);
+    let path_hd = dotani::utils::load_sketch(&path_sketch_path).unwrap();
     let path_ids: Vec<String> = path_hd
         .iter()
         .map(|sketch| sketch.file_str.clone())
         .collect();
     let lexical_ids = [alpha.display().to_string(), zeta.display().to_string()];
     assert_eq!(path_ids, lexical_ids);
+}
+
+#[test]
+fn cli_rejects_conflicting_paths_and_invalid_values() {
+    let dir = TestDir::new("validation");
+    let fasta_dir = dir.path().join("inputs");
+    fs::create_dir_all(&fasta_dir).unwrap();
+    write_valid_fasta(&fasta_dir);
+    let manifest = dir.path().join("manifest.tsv");
+    fs::write(&manifest, "read_path\tfile_id\n").unwrap();
+
+    let conflict = run([
+        "sketch",
+        "--path",
+        fasta_dir.to_str().unwrap(),
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--out",
+        dir.path().join("conflict.sketch").to_str().unwrap(),
+    ]);
+    assert_failure_contains(&conflict, "cannot be used with");
+
+    for hv_d in ["0", "70", "257"] {
+        let output = run([
+            "sketch",
+            "--path",
+            fasta_dir.to_str().unwrap(),
+            "--out",
+            dir.path()
+                .join(format!("hv-{hv_d}.sketch"))
+                .to_str()
+                .unwrap(),
+            "--hv-d",
+            hv_d,
+            "--device",
+            "cpu",
+        ]);
+        assert_failure_contains(&output, "hv_d");
+    }
+
+    let invalid_ull = run([
+        "sketch",
+        "--path",
+        fasta_dir.to_str().unwrap(),
+        "--out",
+        dir.path().join("bad-ull.sketch").to_str().unwrap(),
+        "--ull-p",
+        "2",
+        "--device",
+        "cpu",
+    ]);
+    assert_failure_contains(&invalid_ull, "ULL precision");
+
+    for threshold in ["NaN", "101"] {
+        let output = run([
+            "dist",
+            "--path-r",
+            "missing.sketch",
+            "--path-q",
+            "missing.sketch",
+            "--out",
+            dir.path()
+                .join(format!("ani-{threshold}.tsv"))
+                .to_str()
+                .unwrap(),
+            "--ani-th",
+            threshold,
+        ]);
+        assert_failure_contains(&output, "ANI threshold");
+    }
+
+    let negative_threshold = run([
+        "dist",
+        "--path-r",
+        "missing.sketch",
+        "--path-q",
+        "missing.sketch",
+        "--out",
+        dir.path().join("ani-negative.tsv").to_str().unwrap(),
+        "--ani-th=-1",
+    ]);
+    assert_failure_contains(&negative_threshold, "ANI threshold");
+
+    let zero_threads = run([
+        "dist",
+        "--path-r",
+        "missing.sketch",
+        "--path-q",
+        "missing.sketch",
+        "--out",
+        dir.path().join("zero-threads.tsv").to_str().unwrap(),
+        "--threads",
+        "0",
+    ]);
+    assert_failure_contains(&zero_threads, "greater than zero");
+
+    let zero_ksize = run([
+        "sketch",
+        "--path",
+        fasta_dir.to_str().unwrap(),
+        "--out",
+        dir.path().join("zero-k.sketch").to_str().unwrap(),
+        "--ksize",
+        "0",
+        "--device",
+        "cpu",
+    ]);
+    assert_failure_contains(&zero_ksize, "ksize");
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda_ksize = run([
+            "sketch",
+            "--path",
+            fasta_dir.to_str().unwrap(),
+            "--out",
+            dir.path().join("cuda-large-k.sketch").to_str().unwrap(),
+            "--device",
+            "cuda",
+            "--ksize",
+            "33",
+        ]);
+        assert_failure_contains(&cuda_ksize, "up to 32");
+    }
+}
+
+#[test]
+fn cli_rejects_empty_and_bad_inputs() {
+    let dir = TestDir::new("bad-inputs");
+
+    let empty_inputs = dir.path().join("empty-inputs");
+    fs::create_dir_all(&empty_inputs).unwrap();
+    let empty_dir = run([
+        "sketch",
+        "--path",
+        empty_inputs.to_str().unwrap(),
+        "--out",
+        dir.path().join("empty.sketch").to_str().unwrap(),
+        "--device",
+        "cpu",
+    ]);
+    assert_failure_contains(&empty_dir, "no supported FASTA files");
+
+    let empty_manifest = dir.path().join("empty.tsv");
+    fs::write(&empty_manifest, "read_path\tfile_id\n").unwrap();
+    let manifest = run([
+        "sketch",
+        "--manifest",
+        empty_manifest.to_str().unwrap(),
+        "--out",
+        dir.path().join("empty-manifest.sketch").to_str().unwrap(),
+        "--device",
+        "cpu",
+    ]);
+    assert_failure_contains(&manifest, "header but no data rows");
+
+    let no_kmers = dir.path().join("no-kmers");
+    fs::create_dir_all(&no_kmers).unwrap();
+    fs::write(no_kmers.join("ambiguous.fna"), b">r\nNNNNNN\n").unwrap();
+    let no_valid = run([
+        "sketch",
+        "--path",
+        no_kmers.to_str().unwrap(),
+        "--out",
+        dir.path().join("no-kmers.sketch").to_str().unwrap(),
+        "--device",
+        "cpu",
+        "--ksize",
+        "3",
+    ]);
+    assert_failure_contains(&no_valid, "no valid");
+
+    let malformed = dir.path().join("malformed");
+    fs::create_dir_all(&malformed).unwrap();
+    fs::write(malformed.join("broken.fna"), b"@r\nACGT\n+\n!!\n").unwrap();
+    let malformed_output = run([
+        "sketch",
+        "--path",
+        malformed.to_str().unwrap(),
+        "--out",
+        dir.path().join("malformed.sketch").to_str().unwrap(),
+        "--device",
+        "cpu",
+        "--ksize",
+        "3",
+    ]);
+    assert_failure_contains(&malformed_output, "parse");
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -274,9 +461,10 @@ fn cpu_and_cuda_sketches_match_for_concurrent_files_and_dedup_strategies() {
             cpu_metrics.to_str().unwrap(),
         ]);
         assert_success(&cpu);
-        let cpu_sketch = dotani::utils::load_sketch(&cpu_output);
+        let cpu_sketch = dotani::utils::load_sketch(&cpu_output).unwrap();
         let cpu_ull =
-            dotani::utils::load_ull_sketch(&PathBuf::from(format!("{}.ull", cpu_output.display())));
+            dotani::utils::load_ull_sketch(&PathBuf::from(format!("{}.ull", cpu_output.display())))
+                .unwrap();
         let cpu_sketch_bytes = fs::read(&cpu_output).unwrap();
         let cpu_ull_bytes = fs::read(format!("{}.ull", cpu_output.display())).unwrap();
         let cpu_metrics_counts = metric_counts(&cpu_metrics);
@@ -317,11 +505,12 @@ fn cpu_and_cuda_sketches_match_for_concurrent_files_and_dedup_strategies() {
                 let cuda = run(args);
                 assert_success(&cuda);
 
-                let cuda_sketch = dotani::utils::load_sketch(&cuda_output);
+                let cuda_sketch = dotani::utils::load_sketch(&cuda_output).unwrap();
                 let cuda_ull = dotani::utils::load_ull_sketch(&PathBuf::from(format!(
                     "{}.ull",
                     cuda_output.display()
-                )));
+                )))
+                .unwrap();
                 assert_eq!(cuda_sketch, cpu_sketch);
                 assert_eq!(cuda_ull, cpu_ull);
                 assert_eq!(fs::read(&cuda_output).unwrap(), cpu_sketch_bytes);
@@ -333,6 +522,54 @@ fn cpu_and_cuda_sketches_match_for_concurrent_files_and_dedup_strategies() {
             }
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_dist_failure_does_not_fall_back_to_cpu() {
+    let dir = TestDir::new("cuda-dist-fail-fast");
+    let inputs = dir.path().join("inputs");
+    fs::create_dir_all(&inputs).unwrap();
+    write_valid_fasta(&inputs);
+
+    let sketch_path = dir.path().join("input.sketch");
+    let sketch = run([
+        "sketch",
+        "--path",
+        inputs.to_str().unwrap(),
+        "--out",
+        sketch_path.to_str().unwrap(),
+        "--device",
+        "cpu",
+        "--ksize",
+        "3",
+        "--hv-d",
+        "256",
+    ]);
+    assert_success(&sketch);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dotani"))
+        .env("CUDA_VISIBLE_DEVICES", "-1")
+        .args([
+            "dist",
+            "--path-r",
+            sketch_path.to_str().unwrap(),
+            "--path-q",
+            sketch_path.to_str().unwrap(),
+            "--out",
+            dir.path().join("ani.tsv").to_str().unwrap(),
+            "--ani-th",
+            "0",
+        ])
+        .output()
+        .expect("failed to execute dotani");
+    assert!(!output.status.success(), "CUDA dist unexpectedly succeeded");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("falling back to CPU"), "{text}");
 }
 
 #[cfg(feature = "cuda")]
@@ -370,9 +607,10 @@ fn cpu_and_cuda_sketches_match_for_multirecord_lowercase_and_ambiguous_input() {
         ]);
         assert_success(&cpu);
 
-        let cpu_sketch = dotani::utils::load_sketch(&cpu_output);
+        let cpu_sketch = dotani::utils::load_sketch(&cpu_output).unwrap();
         let cpu_ull =
-            dotani::utils::load_ull_sketch(&PathBuf::from(format!("{}.ull", cpu_output.display())));
+            dotani::utils::load_ull_sketch(&PathBuf::from(format!("{}.ull", cpu_output.display())))
+                .unwrap();
         let cpu_metrics_counts = metric_counts(&cpu_metrics);
 
         for dedup in ["hashset", "sort_unstable"] {
@@ -401,11 +639,12 @@ fn cpu_and_cuda_sketches_match_for_multirecord_lowercase_and_ambiguous_input() {
             ]);
             assert_success(&cuda);
 
-            let cuda_sketch = dotani::utils::load_sketch(&cuda_output);
+            let cuda_sketch = dotani::utils::load_sketch(&cuda_output).unwrap();
             let cuda_ull = dotani::utils::load_ull_sketch(&PathBuf::from(format!(
                 "{}.ull",
                 cuda_output.display()
-            )));
+            )))
+            .unwrap();
             assert_eq!(cuda_sketch, cpu_sketch);
             assert_eq!(cuda_ull, cpu_ull);
             assert_eq!(metric_counts(&cuda_metrics), cpu_metrics_counts);

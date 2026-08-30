@@ -221,6 +221,7 @@ pub fn sketch_cuda(params: SketchParams) -> anyhow::Result<()> {
 
 #[cfg(all(target_arch = "x86_64", feature = "cuda"))]
 pub fn sketch_cuda(params: SketchParams) -> Result<()> {
+    utils::validate_sketch_params(&params)?;
     let sketch_wall_start = Instant::now();
     let inputs = utils::get_sketch_inputs(&params)?;
     let n_file = inputs.len();
@@ -357,10 +358,10 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
         pb.per_sec()
     );
 
-    utils::dump_sketch(&all_filesketch, &params.out_file);
+    utils::dump_sketch(&all_filesketch, &params.out_file)?;
 
     if params.if_ull {
-        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file);
+        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file)?;
     }
 
     if let Some(prefix) = &params.metrics_out {
@@ -524,14 +525,15 @@ fn sketch_one_file_cuda(
     }
 
     let start = Instant::now();
-    sketch.hv_norm_2 = dist::compute_hv_l2_norm(&scratch.hv_host);
+    let hv = &scratch.hv_host[..sketch.hv_d];
+    sketch.hv_norm_2 = dist::compute_hv_l2_norm(hv);
     metrics.hv_norm_ns = start.elapsed().as_nanos();
 
     let start = Instant::now();
     if params.if_compressed {
-        sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &scratch.hv_host) };
+        sketch.hv_quant_bits = hd::compress_hd_sketch(&mut sketch, hv)?;
     } else {
-        sketch.hv = scratch.hv_host.clone();
+        sketch.hv = hv.to_vec();
     }
     metrics.hd_compress_ns = start.elapsed().as_nanos();
     metrics.total_worker_ns = worker_start.elapsed().as_nanos();
@@ -565,7 +567,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
         0
     };
     let fasta_start = Instant::now();
-    let merged = fastx_reader::read_merge_seq(read_path);
+    let merged = fastx_reader::read_merge_seq(read_path)?;
     let fastx_reader::MergedSequence {
         sequence: fna_seqs,
         input_bases,
@@ -873,7 +875,7 @@ pub fn cuda_mmhash_bitpack_parallel(
     if scaled == 0 {
         return Err(anyhow!("scaled must be greater than zero"));
     }
-    let files = utils::get_fasta_files(&PathBuf::from(path_fna));
+    let files = utils::get_fasta_files(&PathBuf::from(path_fna))?;
     let n_file = files.len();
     let pb = utils::get_progress_bar(n_file);
 
@@ -884,7 +886,7 @@ pub fn cuda_mmhash_bitpack_parallel(
     let sketch_kmer_sets: Vec<HashSet<u64>> = index_vec
         .par_iter()
         .map(|&i| -> Result<HashSet<u64>> {
-            let fna_seqs = fastx_reader::read_merge_seq(&files[i]).sequence;
+            let fna_seqs = fastx_reader::read_merge_seq(&files[i])?.sequence;
 
             let n_bps = fna_seqs.len();
             if n_bps < ksize {
@@ -968,7 +970,7 @@ pub fn cuda_t1ha2_hash_parallel(
     if scaled == 0 {
         return Err(anyhow!("scaled must be greater than zero"));
     }
-    let files = utils::get_fasta_files(&PathBuf::from(path_fna));
+    let files = utils::get_fasta_files(&PathBuf::from(path_fna))?;
 
     let n_file = files.len();
     let pb = utils::get_progress_bar(n_file);
@@ -980,7 +982,7 @@ pub fn cuda_t1ha2_hash_parallel(
     let sketch_kmer_sets: Vec<HashSet<u64>> = index_vec
         .par_iter()
         .map(|i| -> Result<HashSet<u64>> {
-            let fna_seqs = fastx_reader::read_merge_seq(&files[*i]).sequence;
+            let fna_seqs = fastx_reader::read_merge_seq(&files[*i])?.sequence;
 
             let n_bps = fna_seqs.len();
             if n_bps < ksize {

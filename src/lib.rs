@@ -293,6 +293,46 @@ mod tests {
     }
 
     #[test]
+    fn hd_encode_cpu_edge_cases_are_explicit() {
+        let empty_hashes = HashSet::new();
+        let empty_hv = hd::encode_hash_hd(&empty_hashes, &sketch_for_hv(256));
+        assert_eq!(empty_hv, vec![0; 256]);
+
+        let one_hash = HashSet::from([0x1234_5678_9abc_def0]);
+        let one_hash_hv = hd::encode_hash_hd(&one_hash, &sketch_for_hv(256));
+        assert_eq!(one_hash_hv.len(), 256);
+        assert!(
+            one_hash_hv
+                .iter()
+                .all(|&coordinate| coordinate == -1 || coordinate == 1)
+        );
+
+        let zero_hash = HashSet::from([0]);
+        let zero_hash_hv = hd::encode_hash_hd(&zero_hash, &sketch_for_hv(256));
+        let zero_hash_bits = direct_seek_wyrng(0, 0);
+        let expected_zero_hash_hv: Vec<i32> = (0..256)
+            .map(|bit| {
+                let rnd = if bit < 64 {
+                    zero_hash_bits
+                } else {
+                    direct_seek_wyrng(0, bit / 64)
+                };
+                -1 + (((rnd >> (bit % 64)) & 1) << 1) as i32
+            })
+            .collect();
+        assert_eq!(zero_hash_hv, expected_zero_hash_hv);
+
+        let multi_hashes =
+            HashSet::from([0, 1, 0x1234_5678_9abc_def0, 0x8000_0000_0000_0000, u64::MAX]);
+        let multi_hash_hv = hd::encode_hash_hd(&multi_hashes, &sketch_for_hv(256));
+        assert_eq!(multi_hash_hv.len(), 256);
+
+        for invalid in [0, 70, 257] {
+            assert!(hd::validate_hv_dimension(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn hd_encode_simd_matches_scalar_when_available() {
         let sketch = sketch_for_hv(1024);
         let hashes = fixed_hashes();
@@ -316,8 +356,8 @@ mod tests {
             .map(|i| ((i as i32 % 257) - 128) / 3)
             .collect();
 
-        sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
-        let decoded = unsafe { hd::decompress_hd_sketch(&mut sketch) };
+        sketch.hv_quant_bits = hd::compress_hd_sketch(&mut sketch, &hv).unwrap();
+        let decoded = hd::decompress_hd_sketch(&mut sketch).unwrap();
 
         assert_eq!(decoded, hv);
     }
@@ -348,7 +388,7 @@ mod tests {
         }
         fs::write(dir.join("ignored.txt"), b">s\nACGT\n").unwrap();
 
-        let files = utils::get_fasta_files(&dir);
+        let files = utils::get_fasta_files(&dir).unwrap();
         let mut names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
