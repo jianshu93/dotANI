@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
@@ -435,6 +435,10 @@ struct TileBatchResult {
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
     ref_uploads: usize,
+    resident_tiles: usize,
+    resident_fallback_tiles: usize,
+    resident_upload_ns: u128,
+    resident_upload_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -461,6 +465,11 @@ struct GpuStreamBreakdown {
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
     ref_uploads: usize,
+    resident_tiles: usize,
+    resident_fallback_tiles: usize,
+    resident_flatten_ns: u128,
+    resident_upload_ns: u128,
+    resident_upload_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -486,7 +495,66 @@ impl GpuStreamBreakdown {
         self.ref_h2d_bytes += batch.ref_h2d_bytes;
         self.out_d2h_bytes += batch.out_d2h_bytes;
         self.ref_uploads += batch.ref_uploads;
+        self.resident_tiles += batch.resident_tiles;
+        self.resident_fallback_tiles += batch.resident_fallback_tiles;
+        self.resident_upload_ns += batch.resident_upload_ns;
+        self.resident_upload_bytes += batch.resident_upload_bytes;
     }
+}
+
+/// Safety margin added on top of the resident upload and tile-output bytes so
+/// the resident symmetric path leaves room for allocator/scratch variance.
+#[cfg(feature = "cuda")]
+const RESIDENT_SAFETY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Resident symmetric path byte requirements, computed without flattening or
+/// allocating the full host matrix. Returns `(upload_bytes, required_bytes)`
+/// with checked arithmetic, or `None` when any component would overflow
+/// `usize` (treated as resident-path infeasible).
+#[cfg(feature = "cuda")]
+fn resident_matrix_bytes(
+    num_rows: usize,
+    hv_d: usize,
+    num_cards: usize,
+    tile_query: usize,
+    tile_ref: usize,
+) -> Option<(usize, usize)> {
+    let upload_bytes = num_rows
+        .checked_mul(hv_d)?
+        .checked_mul(std::mem::size_of::<i32>())?
+        .checked_add(num_cards.checked_mul(std::mem::size_of::<f64>())?)?;
+    let required_bytes = upload_bytes
+        .checked_add(
+            tile_query
+                .checked_mul(tile_ref)?
+                .checked_mul(std::mem::size_of::<i64>())?,
+        )?
+        .checked_add(RESIDENT_SAFETY_BYTES)?;
+    Some((upload_bytes, required_bytes))
+}
+
+/// Returns the shared resident host matrix when the probed free VRAM strictly
+/// exceeds the required bytes, flattening `source` into `cell` at most once.
+/// `None` means the worker must fall back to the tiled path; the host matrix
+/// is never flattened for infeasible or failed free-memory probes.
+#[cfg(feature = "cuda")]
+fn resident_flat_if_feasible<'a>(
+    free_vram: usize,
+    required_bytes: usize,
+    cell: &'a OnceLock<(Vec<i32>, u128)>,
+    source: &'a [FileSketch],
+) -> Option<&'a [i32]> {
+    if free_vram <= required_bytes {
+        return None;
+    }
+    Some(
+        cell.get_or_init(|| {
+            let start = Instant::now();
+            (flatten_hv_matrix(source), start.elapsed().as_nanos())
+        })
+        .0
+        .as_slice(),
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -517,6 +585,32 @@ fn stream_hv_ani_gpu_multi(
 
     let ng = device_count()?.max(1);
     info!("Using {} GPU worker(s) for tiled dot-product", ng);
+    // Symmetric mode can reuse one resident host matrix for both query and
+    // reference tiles. Byte requirements are computed up front, but the full
+    // host copy is flattened lazily and at most once through the shared cell
+    // below, and only after a GPU worker confirms via a free-VRAM check that
+    // it will use the resident path. If every worker falls back to tiled
+    // uploads, the copy is never made. The cell stores the flatten duration
+    // beside the matrix for the stream breakdown.
+    let resident_lazy = if if_symmetric {
+        resident_matrix_bytes(
+            ref_filesketch.len(),
+            hv_d,
+            ref_cards.len(),
+            tile_query,
+            tile_ref,
+        )
+        .map(|(upload_bytes, required_bytes)| {
+            (
+                OnceLock::<(Vec<i32>, u128)>::new(),
+                upload_bytes,
+                required_bytes,
+            )
+        })
+    } else {
+        None
+    };
+    let resident_lazy = resident_lazy.as_ref();
 
     let mut jobs = Vec::<GpuTileJob>::new();
     for i0 in (0..ref_filesketch.len()).step_by(tile_ref) {
@@ -539,10 +633,66 @@ fn stream_hv_ani_gpu_multi(
             let tx = tx.clone();
             let jobs = Arc::clone(&jobs);
             let next = Arc::clone(&next);
+            let resident_lazy = resident_lazy;
 
             scope.spawn(move || {
                 let worker = || -> anyhow::Result<()> {
                     let mut gpu = GpuDotExecutor::new(dev_id)?;
+                    let mut resident_upload_ns_pending = 0u128;
+                    let mut resident_upload_bytes_pending = 0usize;
+                    let resident_matrix = if let Some((cell, upload_bytes, required_bytes)) =
+                        resident_lazy
+                    {
+                        match gpu.free_memory_bytes() {
+                            Ok(free_vram) => {
+                                match resident_flat_if_feasible(
+                                    free_vram,
+                                    *required_bytes,
+                                    cell,
+                                    ref_filesketch,
+                                ) {
+                                    Some(flat) => {
+                                        let upload_start = Instant::now();
+                                        match gpu
+                                            .upload_resident_matrix(flat, ref_filesketch.len(), hv_d)
+                                        {
+                                            Ok(matrix) => {
+                                                resident_upload_ns_pending =
+                                                    upload_start.elapsed().as_nanos();
+                                                resident_upload_bytes_pending = *upload_bytes;
+                                                Some(matrix)
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "GPU worker {} resident matrix upload failed, falling back to tiled path: {e:?}",
+                                                    dev_id
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        warn!(
+                                            "GPU worker {} free VRAM insufficient for resident symmetric matrix, falling back to tiled path: free_mb={:.1} required_mb={:.1}",
+                                            dev_id,
+                                            free_vram as f64 / (1024.0 * 1024.0),
+                                            *required_bytes as f64 / (1024.0 * 1024.0)
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "GPU worker {} failed to query free VRAM, falling back to tiled path: {e:?}",
+                                    dev_id
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     let mut cached_i0 = usize::MAX;
                     let mut cached_i1 = usize::MAX;
@@ -557,36 +707,55 @@ fn stream_hv_ani_gpu_multi(
 
                         let job = jobs[job_idx];
 
-                        let mut flatten_ref_ns = 0u128;
-                        let mut ref_flatten_events = 0usize;
-                        if job.i0 != cached_i0 || job.i1 != cached_i1 {
-                            cached_i0 = job.i0;
-                            cached_i1 = job.i1;
-
-                            let ref_block = &ref_filesketch[job.i0..job.i1];
-                            cached_nr = ref_block.len();
-                            let flatten_ref_start = Instant::now();
-                            cached_ref_flat = flatten_hv_matrix(ref_block);
-                            flatten_ref_ns = flatten_ref_start.elapsed().as_nanos();
-                            ref_flatten_events = 1;
-                        }
-
                         let query_block = &query_filesketch[job.j0..job.j1];
                         let nq = query_block.len();
-                        let flatten_query_start = Instant::now();
-                        let query_flat = flatten_hv_matrix(query_block);
-                        let flatten_query_ns = flatten_query_start.elapsed().as_nanos();
+                        let nr = job.i1 - job.i0;
+                        let mut flatten_ref_ns = 0u128;
+                        let mut flatten_query_ns = 0u128;
+                        let mut ref_flatten_events = 0usize;
+                        let mut resident_tiles = 0usize;
+                        let mut resident_fallback_tiles = 0usize;
 
-                        let mut tile_dots = vec![0i64; nq * cached_nr];
-                        let gpu_timings = gpu.compute_tile(
-                            &query_flat,
-                            nq,
-                            &cached_ref_flat,
-                            cached_nr,
-                            hv_d,
-                            &mut tile_dots,
-                            ref_flatten_events > 0,
-                        )?;
+                        let mut tile_dots = vec![0i64; nq * nr];
+                        let gpu_timings = if let Some(resident) = resident_matrix.as_ref() {
+                            resident_tiles = 1;
+                            gpu.compute_tile_resident(
+                                resident,
+                                job.j0,
+                                nq,
+                                resident,
+                                job.i0,
+                                nr,
+                                &mut tile_dots,
+                            )?
+                        } else {
+                            resident_fallback_tiles = usize::from(if_symmetric);
+                            if job.i0 != cached_i0 || job.i1 != cached_i1 {
+                                cached_i0 = job.i0;
+                                cached_i1 = job.i1;
+
+                                let ref_block = &ref_filesketch[job.i0..job.i1];
+                                cached_nr = ref_block.len();
+                                let flatten_ref_start = Instant::now();
+                                cached_ref_flat = flatten_hv_matrix(ref_block);
+                                flatten_ref_ns = flatten_ref_start.elapsed().as_nanos();
+                                ref_flatten_events = 1;
+                            }
+
+                            let flatten_query_start = Instant::now();
+                            let query_flat = flatten_hv_matrix(query_block);
+                            flatten_query_ns = flatten_query_start.elapsed().as_nanos();
+
+                            gpu.compute_tile(
+                                &query_flat,
+                                nq,
+                                &cached_ref_flat,
+                                cached_nr,
+                                hv_d,
+                                &mut tile_dots,
+                                ref_flatten_events > 0,
+                            )?
+                        };
 
                         let postprocess_start = Instant::now();
                         let mut text = String::new();
@@ -596,7 +765,7 @@ fn stream_hv_ani_gpu_multi(
                         let mut nonpositive_skipped = 0usize;
 
                         for q_local in 0..nq {
-                            for r_local in 0..cached_nr {
+                            for r_local in 0..nr {
                                 let i = job.i0 + r_local;
                                 let j = job.j0 + q_local;
 
@@ -606,7 +775,7 @@ fn stream_hv_ani_gpu_multi(
 
                                 num_pairs_done += 1;
 
-                                let dot = tile_dots[q_local * cached_nr + r_local] as f64;
+                                let dot = tile_dots[q_local * nr + r_local] as f64;
                                 let inter_hat = dot / hv_d as f64;
                                 if inter_hat <= 0.0 && ani_threshold > 0.0 {
                                     nonpositive_skipped += 1;
@@ -658,6 +827,12 @@ fn stream_hv_ani_gpu_multi(
                             ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
                             out_d2h_bytes: gpu_timings.out_d2h_bytes,
                             ref_uploads: usize::from(gpu_timings.ref_upload_performed),
+                            resident_tiles,
+                            resident_fallback_tiles,
+                            resident_upload_ns: std::mem::take(&mut resident_upload_ns_pending),
+                            resident_upload_bytes: std::mem::take(
+                                &mut resident_upload_bytes_pending,
+                            ),
                         }));
                     }
 
@@ -677,6 +852,11 @@ fn stream_hv_ani_gpu_multi(
         let mut first_error = None;
         let stream_wall_start = Instant::now();
         let mut breakdown = GpuStreamBreakdown::default();
+        // The lazy flatten runs inside GPU workers, so its timing is only final
+        // once every worker has finished and the result channel has closed.
+        breakdown.resident_flatten_ns = resident_lazy
+            .and_then(|(cell, _, _)| cell.get().map(|(_, flatten_ns)| *flatten_ns))
+            .unwrap_or(0);
 
         while received_jobs < total_jobs {
             match rx.recv() {
@@ -707,8 +887,15 @@ fn stream_hv_ani_gpu_multi(
             Err(e)
         } else {
             // Worker timings are aggregate worker-sums; with multiple GPUs they can exceed wall.
+            let resident_mode = if !if_symmetric {
+                "disabled"
+            } else if breakdown.resident_tiles > 0 && breakdown.resident_fallback_tiles == 0 {
+                "symmetric"
+            } else {
+                "fallback"
+            };
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} output_mb={:.3} ref_flatten_events={} ref_uploads={} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
@@ -716,12 +903,16 @@ fn stream_hv_ani_gpu_multi(
                 breakdown.prefilter_skipped,
                 breakdown.ani_evals,
                 breakdown.nonpositive_skipped,
+                resident_mode,
                 breakdown.output_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.ref_flatten_events,
                 breakdown.ref_uploads,
+                breakdown.resident_upload_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.query_h2d_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.ref_h2d_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.out_d2h_bytes as f64 / (1024.0 * 1024.0),
+                ns_to_secs(breakdown.resident_flatten_ns),
+                ns_to_secs(breakdown.resident_upload_ns),
                 ns_to_secs(breakdown.flatten_ref_ns),
                 ns_to_secs(breakdown.flatten_query_ns),
                 ns_to_secs(breakdown.query_h2d_ns),

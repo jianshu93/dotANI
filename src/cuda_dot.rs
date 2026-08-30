@@ -240,6 +240,12 @@ pub struct GpuDotExecutor {
     cap_out: usize,
 }
 
+pub struct GpuResidentMatrix {
+    d_hv: CudaSlice<i32>,
+    rows: usize,
+    hv_d: usize,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GpuTileTimings {
     pub query_h2d_ns: u128,
@@ -325,6 +331,33 @@ impl GpuDotExecutor {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn free_memory_bytes(&self) -> Result<usize> {
+        let (free, _total) = self.ctx.mem_get_info()?;
+        Ok(free)
+    }
+
+    pub fn upload_resident_matrix(
+        &mut self,
+        flat_hv: &[i32],
+        rows: usize,
+        hv_d: usize,
+    ) -> Result<GpuResidentMatrix> {
+        if flat_hv.len() != rows * hv_d {
+            bail!(
+                "resident matrix length mismatch: got {}, expected {}",
+                flat_hv.len(),
+                rows * hv_d
+            );
+        }
+        if hv_d == 0 {
+            bail!("hv_d must be > 0");
+        }
+
+        let stream = self.ctx.default_stream();
+        let d_hv = stream.clone_htod(flat_hv)?;
+        Ok(GpuResidentMatrix { d_hv, rows, hv_d })
     }
 
     pub fn compute_tile(
@@ -474,6 +507,140 @@ impl GpuDotExecutor {
             ref_upload_performed,
         })
     }
+
+    pub fn compute_tile_resident(
+        &mut self,
+        query: &GpuResidentMatrix,
+        q0: usize,
+        nq: usize,
+        refs: &GpuResidentMatrix,
+        r0: usize,
+        nr: usize,
+        out: &mut [i64],
+    ) -> Result<GpuTileTimings> {
+        if query.hv_d != refs.hv_d {
+            bail!(
+                "resident matrix dimension mismatch: query d={} ref d={}",
+                query.hv_d,
+                refs.hv_d
+            );
+        }
+        if q0.checked_add(nq).is_none_or(|end| end > query.rows) {
+            bail!(
+                "resident query range out of bounds: q0={} nq={} rows={}",
+                q0,
+                nq,
+                query.rows
+            );
+        }
+        if r0.checked_add(nr).is_none_or(|end| end > refs.rows) {
+            bail!(
+                "resident ref range out of bounds: r0={} nr={} rows={}",
+                r0,
+                nr,
+                refs.rows
+            );
+        }
+        if out.len() != nq * nr {
+            bail!(
+                "out length mismatch: got {}, expected {}",
+                out.len(),
+                nq * nr
+            );
+        }
+        if query.hv_d == 0 {
+            bail!("d must be > 0");
+        }
+
+        let t0 = Instant::now();
+
+        self.ensure_out_capacity(out.len())?;
+
+        let stream = self.ctx.default_stream();
+        let func = self
+            .module
+            .load_function("dot_rect_i32_i64_tiled_rb")
+            .context("load function dot_rect_i32_i64_tiled_rb")?;
+
+        let d_out = self
+            .d_out
+            .as_mut()
+            .context("internal error: d_out missing after allocation")?;
+
+        let q_start = q0 * query.hv_d;
+        let q_end = q_start + nq * query.hv_d;
+        let r_start = r0 * refs.hv_d;
+        let r_end = r_start + nr * refs.hv_d;
+        let d_query = query.d_hv.slice(q_start..q_end);
+        let d_ref = refs.d_hv.slice(r_start..r_end);
+
+        const BLOCK_M: usize = 64;
+        const BLOCK_N: usize = 32;
+        const BLOCK_K: usize = 32;
+        const THREAD_M: usize = 4;
+        const THREAD_N: usize = 2;
+
+        const BLK_X: usize = BLOCK_N / THREAD_N;
+        const BLK_Y: usize = BLOCK_M / THREAD_M;
+
+        let smem_bytes = shared_mem_bytes_i32(BLOCK_M, BLOCK_N, BLOCK_K);
+
+        let cfg = LaunchConfig {
+            grid_dim: (nr.div_ceil(BLOCK_N) as u32, nq.div_ceil(BLOCK_M) as u32, 1),
+            block_dim: (BLK_X as u32, BLK_Y as u32, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+
+        let nq_i32 = nq as i32;
+        let nr_i32 = nr as i32;
+        let d_i32 = query.hv_d as i32;
+
+        let mut launch = stream.launch_builder(&func);
+        launch.arg(&d_query);
+        launch.arg(&d_ref);
+        launch.arg(&nq_i32);
+        launch.arg(&nr_i32);
+        launch.arg(&d_i32);
+        launch.arg(&mut *d_out);
+
+        let compute_d2h_start = Instant::now();
+        unsafe { launch.launch(cfg) }?;
+
+        let out_d2h_elems;
+        if self.cap_out == out.len() {
+            stream.memcpy_dtoh(d_out, out)?;
+            out_d2h_elems = out.len();
+        } else {
+            let mut tmp = vec![0i64; self.cap_out];
+            stream.memcpy_dtoh(d_out, &mut tmp)?;
+            out.copy_from_slice(&tmp[..out.len()]);
+            out_d2h_elems = self.cap_out;
+        }
+        let compute_d2h_ns = compute_d2h_start.elapsed().as_nanos();
+
+        log::debug!(
+            "GPU resident dot tile done on gpu_id={} q0={} nq={} r0={} nr={} d={} out={:.2} MiB in {:.3}s",
+            self.gpu_id,
+            q0,
+            nq,
+            r0,
+            nr,
+            query.hv_d,
+            mib(out.len() * std::mem::size_of::<i64>()),
+            t0.elapsed().as_secs_f64()
+        );
+
+        Ok(GpuTileTimings {
+            query_h2d_ns: 0,
+            ref_h2d_ns: 0,
+            compute_d2h_ns,
+            total_ns: t0.elapsed().as_nanos(),
+            query_h2d_bytes: 0,
+            ref_h2d_bytes: 0,
+            out_d2h_bytes: out_d2h_elems * std::mem::size_of::<i64>(),
+            ref_upload_performed: false,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -559,5 +726,82 @@ mod tests {
         assert_eq!(second, vec![5, 7]);
         assert!(timings.ref_upload_performed);
         assert_eq!(timings.ref_h2d_bytes, 4 * std::mem::size_of::<i32>());
+    }
+
+    #[test]
+    fn resident_full_matrix_tile_matches_tiled_compute_tile() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let matrix = [1, 2, 3, 4, 0, 1, 2, 0, 2];
+        let resident = gpu
+            .upload_resident_matrix(&matrix, 3, 3)
+            .expect("resident upload");
+
+        let mut resident_out = vec![0i64; 9];
+        gpu.compute_tile_resident(&resident, 0, 3, &resident, 0, 3, &mut resident_out)
+            .expect("resident tile should compute");
+
+        let mut tiled_out = vec![0i64; 9];
+        gpu.compute_tile(&matrix, 3, &matrix, 3, 3, &mut tiled_out, true)
+            .expect("tiled tile should compute");
+
+        assert_eq!(resident_out, tiled_out);
+    }
+
+    #[test]
+    fn resident_slicing_with_nonzero_offsets_returns_expected_submatrix() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let matrix = [
+            1, 0, 0, 0, // row 0
+            0, 1, 0, 0, // row 1
+            1, 1, 0, 0, // row 2
+            2, 0, 1, 0, // row 3
+        ];
+        let resident = gpu
+            .upload_resident_matrix(&matrix, 4, 4)
+            .expect("resident upload");
+
+        let mut out = vec![0i64; 4];
+        gpu.compute_tile_resident(&resident, 1, 2, &resident, 2, 2, &mut out)
+            .expect("resident tile should compute");
+
+        assert_eq!(out, vec![1, 0, 2, 2]);
+    }
+
+    #[test]
+    fn symmetric_resident_mode_can_reuse_same_matrix_for_query_and_ref() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let matrix = [2, 0, 0, 0, 3, 1];
+        let resident = gpu
+            .upload_resident_matrix(&matrix, 2, 3)
+            .expect("resident upload");
+
+        let mut out = vec![0i64; 4];
+        let timings = gpu
+            .compute_tile_resident(&resident, 0, 2, &resident, 0, 2, &mut out)
+            .expect("resident tile should compute");
+
+        assert_eq!(out, vec![4, 0, 0, 10]);
+        assert_eq!(timings.query_h2d_bytes, 0);
+        assert_eq!(timings.ref_h2d_bytes, 0);
+        assert!(!timings.ref_upload_performed);
+    }
+
+    #[test]
+    fn fallback_tiled_path_remains_correct() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let query = [1, 2, 0, 1];
+        let refs = [3, 0, 0, 4, 5, 6];
+
+        let (out, timings) = compute(&mut gpu, &query, 2, &refs, 3, 2, true);
+
+        assert_eq!(out, vec![3, 8, 17, 0, 4, 6]);
+        assert_eq!(
+            timings.query_h2d_bytes,
+            query.len() * std::mem::size_of::<i32>()
+        );
+        assert_eq!(
+            timings.ref_h2d_bytes,
+            refs.len() * std::mem::size_of::<i32>()
+        );
     }
 }
