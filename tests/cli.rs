@@ -79,6 +79,75 @@ fn write_valid_fasta(dir: &Path) -> PathBuf {
 }
 
 #[test]
+fn cli_help_defaults() {
+    let sketch_help = run(["sketch", "--help"]);
+    assert_success(&sketch_help);
+    let sketch_text = String::from_utf8_lossy(&sketch_help.stdout);
+    assert!(sketch_text.contains("--hv-d"));
+    assert!(sketch_text.contains("sort_unstable"));
+
+    let dist_help = run(["dist", "--help"]);
+    assert_success(&dist_help);
+    let dist_text = String::from_utf8_lossy(&dist_help.stdout);
+    assert!(dist_text.contains("--output-mode"));
+    assert!(dist_text.contains("rows"));
+}
+
+#[test]
+fn valid_hv_dimensions_round_trip_and_count_output_mode() {
+    let dir = TestDir::new("roundtrip");
+    let inputs = dir.path().join("inputs");
+    fs::create_dir_all(&inputs).unwrap();
+    write_valid_fasta(&inputs);
+
+    for hv_d in ["256", "1024", "4096"] {
+        let output = dir.path().join(format!("{hv_d}.sketch"));
+        let sketch = run([
+            "sketch",
+            "--path",
+            inputs.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+            "--device",
+            "cpu",
+            "--ksize",
+            "3",
+            "--hv-d",
+            hv_d,
+            "--canonical",
+            "false",
+        ]);
+        assert_success(&sketch);
+        assert!(output.is_file());
+        assert!(PathBuf::from(format!("{}.ull", output.display())).is_file());
+    }
+
+    let output = dir.path().join("256.sketch");
+    let ani_output = dir.path().join("count.tsv");
+    let dist = run([
+        "dist",
+        "--path-r",
+        output.to_str().unwrap(),
+        "--path-q",
+        output.to_str().unwrap(),
+        "--out",
+        ani_output.to_str().unwrap(),
+        "--output-mode",
+        "count",
+        "--ani-th",
+        "0",
+        "--threads",
+        "1",
+    ]);
+    assert_success(&dist);
+    assert!(
+        fs::read_to_string(ani_output)
+            .unwrap()
+            .contains("mode\tcount")
+    );
+}
+
+#[test]
 fn manifest_cli_preserves_row_order_and_file_ids() {
     let dir = TestDir::new("manifest-e2e");
     let inputs = dir.path().join("inputs");

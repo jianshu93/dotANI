@@ -1,10 +1,22 @@
+#[cfg(feature = "cuda")]
+use super::stream_hv_ani_gpu_multi;
 use super::{
     GpuPipelineOutput, ani_from_intersection_and_cardinalities, consume_gpu_result_queue, dist,
+    stream_hv_ani_cpu, write_count_summary,
 };
-use crate::types::{FileSketch, SketchDist};
+use crate::types::{DistOutputMode, FileSketch, FileUllSketch, SketchDist};
+use std::collections::HashSet;
+#[cfg(feature = "cuda")]
+use std::fs::File;
+#[cfg(feature = "cuda")]
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// --- bounded GPU result queue write-failure shutdown regression tests ---
 
 /// Writer that succeeds for a controlled number of writes and then fails
 /// deterministically, simulating an output device error (e.g. /dev/full).
@@ -236,7 +248,6 @@ fn gpu_pipeline_consumer_keeps_first_pipeline_error_over_write_failure() {
 }
 
 #[test]
-#[test]
 fn ani_clamps_estimated_jaccard_overshoot_to_100() {
     let ani = ani_from_intersection_and_cardinalities(120.0, 100.0, 100.0, 16);
     assert!(
@@ -271,6 +282,11 @@ fn dist_validates_public_boundary_parameters_before_loading_files() {
     }
 }
 
+fn temp_ani_path(label: &str) -> PathBuf {
+    let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("dotani_{label}_{}_{}.ani", std::process::id(), id))
+}
+
 fn test_filesketch(file_str: &str, hv: Vec<i32>) -> FileSketch {
     FileSketch {
         ksize: 1,
@@ -283,6 +299,513 @@ fn test_filesketch(file_str: &str, hv: Vec<i32>) -> FileSketch {
         file_str: file_str.to_string(),
         hv,
     }
+}
+
+fn test_ull(file_str: &str) -> FileUllSketch {
+    let ull = ultraloglog::UltraLogLog::new(14).unwrap();
+    FileUllSketch {
+        ksize: 1,
+        canonical: true,
+        seed: 123,
+        ull_p: 14,
+        file_str: file_str.to_string(),
+        ull_state: ull.get_state().to_vec(),
+    }
+}
+
+fn valid_distance_inputs() -> (
+    Vec<FileSketch>,
+    Vec<FileSketch>,
+    Vec<FileUllSketch>,
+    Vec<FileUllSketch>,
+) {
+    let refs = vec![
+        test_filesketch("r0", vec![1; 256]),
+        test_filesketch("r1", vec![2; 256]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![1; 256]),
+        test_filesketch("q1", vec![2; 256]),
+    ];
+    let ref_ull = vec![test_ull("r0"), test_ull("r1")];
+    let query_ull = vec![test_ull("q0"), test_ull("q1")];
+    (refs, queries, ref_ull, query_ull)
+}
+
+fn read_rows_as_set(path: &std::path::Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .expect("failed to read ANI output")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn test_dot_tile_batch(
+    job: super::GpuTileJob,
+    nq: usize,
+    nr: usize,
+    dots: Vec<i64>,
+) -> super::DotTileBatch {
+    super::DotTileBatch {
+        job,
+        nq,
+        nr,
+        tile_dots: dots,
+        ref_flatten_events: 0,
+        flatten_ref_ns: 0,
+        flatten_query_ns: 0,
+        query_h2d_ns: 0,
+        ref_h2d_ns: 0,
+        compute_d2h_ns: 0,
+        gpu_tile_total_ns: 0,
+        query_h2d_bytes: 0,
+        ref_h2d_bytes: 0,
+        out_d2h_bytes: 0,
+        ref_uploads: 0,
+        resident_tiles: 0,
+        resident_fallback_tiles: 0,
+        resident_upload_ns: 0,
+        resident_upload_bytes: 0,
+    }
+}
+
+#[test]
+fn cpu_stream_ani_threshold_zero_keeps_zero_ani_rows() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let out = temp_ani_path("threshold_zero");
+    let pb = indicatif::ProgressBar::hidden();
+
+    let hits = stream_hv_ani_cpu(
+        &out,
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        0.0,
+        DistOutputMode::Rows,
+    )
+    .expect("CPU stream should compute");
+    assert_eq!(hits, 4);
+    assert_eq!(
+        read_rows_as_set(&out),
+        HashSet::from([
+            "r0\tq0\t90.000".to_string(),
+            "r0\tq1\t0.000".to_string(),
+            "r1\tq0\t0.000".to_string(),
+            "r1\tq1\t90.000".to_string(),
+        ])
+    );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn cpu_stream_normal_threshold_matches_expected_rows_as_set() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let out = temp_ani_path("threshold_85");
+    let pb = indicatif::ProgressBar::hidden();
+
+    let hits = stream_hv_ani_cpu(
+        &out,
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        DistOutputMode::Rows,
+    )
+    .expect("CPU stream should compute");
+    assert_eq!(hits, 2);
+    assert_eq!(
+        read_rows_as_set(&out),
+        HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+    );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn cpu_stream_count_mode_matches_rows_hit_count_without_rows_file() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let rows_out = temp_ani_path("rows_count_compare");
+    let count_out = temp_ani_path("count_no_rows");
+    let _ = std::fs::remove_file(&count_out);
+    let pb = indicatif::ProgressBar::hidden();
+
+    let row_hits = stream_hv_ani_cpu(
+        &rows_out,
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        DistOutputMode::Rows,
+    )
+    .expect("CPU rows stream should compute");
+    let row_count = std::fs::read_to_string(&rows_out)
+        .expect("failed to read rows output")
+        .lines()
+        .count();
+    let count_hits = stream_hv_ani_cpu(
+        &count_out,
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        DistOutputMode::Count,
+    )
+    .expect("CPU count stream should compute");
+
+    assert_eq!(row_hits, 2);
+    assert_eq!(row_count, row_hits);
+    assert_eq!(count_hits, row_hits);
+    assert!(!count_out.exists());
+
+    let _ = std::fs::remove_file(rows_out);
+}
+
+#[test]
+fn count_summary_tsv_matches_exact_expected_payload() {
+    let out = temp_ani_path("count_summary");
+
+    write_count_summary(&out, DistOutputMode::Count, 2, 3, 6, 4, 85.0).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("failed to read count summary"),
+        "metric\tvalue\nmode\tcount\nrefs\t2\nqueries\t3\npairs\t6\nhits\t4\nani_threshold\t85\n"
+    );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_postprocess_helper_symmetric_skips_diagonal_and_lower_triangle() {
+    let sketches = vec![
+        test_filesketch("s0", vec![1, 0, 0, 0]),
+        test_filesketch("s1", vec![0, 1, 0, 0]),
+        test_filesketch("s2", vec![1, 0, 0, 0]),
+    ];
+    let cards = vec![1.0, 1.0, 1.0];
+    let batch = test_dot_tile_batch(
+        super::GpuTileJob {
+            i0: 0,
+            i1: 3,
+            j0: 0,
+            j1: 3,
+        },
+        3,
+        3,
+        vec![4, 0, 4, 0, 4, 0, 4, 0, 4],
+    );
+
+    let result = super::postprocess_dot_tile_batch(
+        batch,
+        &sketches,
+        &sketches,
+        &cards,
+        &cards,
+        1,
+        true,
+        0.0,
+        DistOutputMode::Rows,
+    );
+
+    assert_eq!(result.num_pairs_done, 3);
+    assert_eq!(result.ani_evals, 3);
+    assert_eq!(
+        result.text.lines().collect::<HashSet<_>>(),
+        HashSet::from(["s0\ts1\t0.000", "s0\ts2\t100.000", "s1\ts2\t0.000"])
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_postprocess_helper_threshold_zero_keeps_zero_ani_rows() {
+    let refs = vec![test_filesketch("r0", vec![4, 0, 0, 0])];
+    let queries = vec![test_filesketch("q0", vec![0, 4, 0, 0])];
+    let cards = vec![100.0];
+    let batch = test_dot_tile_batch(
+        super::GpuTileJob {
+            i0: 0,
+            i1: 1,
+            j0: 0,
+            j1: 1,
+        },
+        1,
+        1,
+        vec![0],
+    );
+
+    let result = super::postprocess_dot_tile_batch(
+        batch,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        0.0,
+        DistOutputMode::Rows,
+    );
+
+    assert_eq!(result.num_hits, 1);
+    assert_eq!(result.ani_evals, 1);
+    assert_eq!(result.nonpositive_skipped, 0);
+    assert_eq!(result.text, "r0\tq0\t0.000\n");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_postprocess_helper_positive_threshold_filters_and_counts() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 0, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let batch = test_dot_tile_batch(
+        super::GpuTileJob {
+            i0: 0,
+            i1: 2,
+            j0: 0,
+            j1: 2,
+        },
+        2,
+        2,
+        vec![360, 0, 0, 0],
+    );
+
+    let result = super::postprocess_dot_tile_batch(
+        batch,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        DistOutputMode::Rows,
+    );
+
+    assert_eq!(result.num_hits, 1);
+    assert_eq!(result.num_pairs_done, 4);
+    assert_eq!(result.ani_evals, 1);
+    assert_eq!(result.nonpositive_skipped, 3);
+    assert_eq!(result.text, "r0\tq0\t90.000\n");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_postprocess_helper_count_mode_matches_rows_hit_count_without_text() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 0, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let batch = test_dot_tile_batch(
+        super::GpuTileJob {
+            i0: 0,
+            i1: 2,
+            j0: 0,
+            j1: 2,
+        },
+        2,
+        2,
+        vec![360, 0, 0, 0],
+    );
+
+    let result = super::postprocess_dot_tile_batch(
+        batch,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        DistOutputMode::Count,
+    );
+
+    assert_eq!(result.num_hits, 1);
+    assert_eq!(result.ani_evals, 1);
+    assert_eq!(result.nonpositive_skipped, 3);
+    assert!(result.text.is_empty());
+    assert_eq!(result.text_bytes, 0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_stream_ani_threshold_zero_keeps_zero_ani_rows() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let out = temp_ani_path("gpu_threshold_zero");
+    let pb = indicatif::ProgressBar::hidden();
+    let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+    let hits = stream_hv_ani_gpu_multi(
+        Some(&mut writer),
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        0.0,
+        1,
+        DistOutputMode::Rows,
+    )
+    .expect("GPU stream should compute");
+    writer.flush().expect("failed to flush output");
+
+    assert_eq!(hits, 4);
+    assert_eq!(
+        read_rows_as_set(&out),
+        HashSet::from([
+            "r0\tq0\t90.000".to_string(),
+            "r0\tq1\t0.000".to_string(),
+            "r1\tq0\t0.000".to_string(),
+            "r1\tq1\t90.000".to_string(),
+        ])
+    );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_stream_normal_threshold_matches_expected_rows_as_set() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let out = temp_ani_path("gpu_threshold_85");
+    let pb = indicatif::ProgressBar::hidden();
+    let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+    let hits = stream_hv_ani_gpu_multi(
+        Some(&mut writer),
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        1,
+        DistOutputMode::Rows,
+    )
+    .expect("GPU stream should compute");
+    writer.flush().expect("failed to flush output");
+
+    assert_eq!(hits, 2);
+    assert_eq!(
+        read_rows_as_set(&out),
+        HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+    );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_stream_symmetric_resident_path_matches_expected_rows_as_set() {
+    let sketches = vec![
+        test_filesketch("s0", vec![4, 0, 0, 0]),
+        test_filesketch("s1", vec![0, 4, 0, 0]),
+        test_filesketch("s2", vec![4, 0, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0, 100.0];
+    let out = temp_ani_path("gpu_symmetric_resident");
+    let pb = indicatif::ProgressBar::hidden();
+    let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+    let hits = stream_hv_ani_gpu_multi(
+        Some(&mut writer),
+        &pb,
+        &sketches,
+        &sketches,
+        &cards,
+        &cards,
+        1,
+        true,
+        0.0,
+        1,
+        DistOutputMode::Rows,
+    )
+    .expect("GPU symmetric stream should compute");
+    writer.flush().expect("failed to flush output");
+
+    assert_eq!(hits, 3);
+    assert_eq!(
+        read_rows_as_set(&out),
+        HashSet::from([
+            "s0\ts1\t0.000".to_string(),
+            "s0\ts2\t4.000".to_string(),
+            "s1\ts2\t0.000".to_string(),
+        ])
+    );
+
+    let _ = std::fs::remove_file(out);
 }
 
 // --- lazy resident host-matrix flattening regression tests ---

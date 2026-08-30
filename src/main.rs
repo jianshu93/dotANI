@@ -263,6 +263,14 @@ fn run() -> Result<()> {
                 .default_value("85.0")
                 .value_parser(parse_ani_threshold)
                 .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("output_mode")
+                .long("output-mode")
+                .help("Dist output mode")
+                .default_value("rows")
+                .value_parser(["rows", "count"])
+                .action(ArgAction::Set),
         );
 
     let matches = Command::new("dotani")
@@ -341,6 +349,7 @@ fn run() -> Result<()> {
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
+            dist_output_mode: types::DistOutputMode::Rows,
         };
 
         let sketch_params = types::SketchParams::new(&cli_params);
@@ -411,6 +420,11 @@ fn run() -> Result<()> {
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
             metrics_out: None,
+            dist_output_mode: types::DistOutputMode::from_cli_value(
+                dist_m
+                    .get_one::<String>("output_mode")
+                    .expect("clap guarantees output-mode has default"),
+            ),
         };
 
         rayon::ThreadPoolBuilder::new()
