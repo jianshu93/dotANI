@@ -2,6 +2,7 @@ use crate::types::*;
 
 #[cfg(feature = "cuda")]
 use {
+    crate::cardinality::CardinalitySketch,
     crate::{dist, fastx_reader, fastx_reader::ReaderGate, hd, hd_cuda, utils},
     anyhow::{Result, anyhow},
     cudarc::{
@@ -21,7 +22,6 @@ use {
         mpsc,
     },
     std::time::Instant,
-    ultraloglog::UltraLogLog,
 };
 
 #[cfg(feature = "cuda")]
@@ -43,7 +43,7 @@ const SEQ_NT4_TABLE: [u8; 256] = [
 struct IndexedSketchResult {
     index: usize,
     sketch: FileSketch,
-    ull_record: Option<FileUllSketch>,
+    cardinality_record: FileCardinalitySketch,
     metrics: FileSketchMetrics,
 }
 
@@ -341,13 +341,11 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
     let results = ordered_indexed_sketch_results(result_slots)?;
 
     let mut all_filesketch = Vec::with_capacity(results.len());
-    let mut all_ullsketch = Vec::with_capacity(results.len());
+    let mut all_cardinality_sketches = Vec::with_capacity(results.len());
     let mut all_metrics = Vec::with_capacity(results.len());
     for result in results {
         all_filesketch.push(result.sketch);
-        if let Some(ull_record) = result.ull_record {
-            all_ullsketch.push(ull_record);
-        }
+        all_cardinality_sketches.push(result.cardinality_record);
         all_metrics.push(result.metrics);
     }
 
@@ -360,9 +358,11 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
 
     utils::dump_sketch(&all_filesketch, &params.out_file)?;
 
-    if params.if_ull {
-        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file)?;
-    }
+    utils::dump_cardinality_sketch(
+        all_cardinality_sketches,
+        params.cardinality_estimator,
+        &params.cardinality_out_file,
+    )?;
 
     if let Some(prefix) = &params.metrics_out {
         utils::dump_sketch_metrics(&all_metrics, prefix, sketch_wall_start.elapsed().as_nanos())?;
@@ -452,58 +452,62 @@ fn sketch_one_file_cuda(
     let hash_and_dedup_start = Instant::now();
     scratch.sampled_hashes.clear();
     let mut restore_full_hashes_after_hd = false;
-    let ull_record = if params.if_ull {
-        let mut ull = UltraLogLog::new(params.ull_p).expect("Invalid UltraLogLog precision");
-        match params.cuda_dedup_strategy {
-            CudaDedupStrategy::HashSet => {
-                scratch.sampled_hash_set.clear();
-                for &hash in &scratch.full_hashes {
-                    ull.add(hash);
-                    scratch.sampled_hash_set.insert(hash);
+    let cardinality_sketch = CardinalitySketch::new(params)?;
+    let cardinality_sketch = match params.cuda_dedup_strategy {
+        CudaDedupStrategy::HashSet => {
+            scratch.sampled_hash_set.clear();
+            let cardinality_sketch = match cardinality_sketch {
+                CardinalitySketch::Ull(mut ull) => {
+                    update_cardinality_and_hashset(
+                        &scratch.full_hashes,
+                        &mut scratch.sampled_hash_set,
+                        |hash| {
+                            ull.add(hash);
+                        },
+                    );
+                    CardinalitySketch::Ull(ull)
                 }
-                scratch
-                    .sampled_hashes
-                    .extend(scratch.sampled_hash_set.iter().copied());
-            }
-            CudaDedupStrategy::SortUnstable => {
-                for &hash in &scratch.full_hashes {
-                    ull.add(hash);
+                CardinalitySketch::Ell(mut ell) => {
+                    update_cardinality_and_hashset(
+                        &scratch.full_hashes,
+                        &mut scratch.sampled_hash_set,
+                        |hash| {
+                            ell.add_hash(hash);
+                        },
+                    );
+                    CardinalitySketch::Ell(ell)
                 }
-                scratch.full_hashes.sort_unstable();
-                scratch.full_hashes.dedup();
-                std::mem::swap(&mut scratch.sampled_hashes, &mut scratch.full_hashes);
-                restore_full_hashes_after_hd = true;
-            }
+            };
+
+            scratch
+                .sampled_hashes
+                .extend(scratch.sampled_hash_set.iter().copied());
+            cardinality_sketch
         }
-        Some(FileUllSketch {
-            ksize: params.ksize,
-            canonical: params.canonical,
-            seed: params.seed,
-            ull_p: params.ull_p,
-            file_str: sketch.file_str.clone(),
-            ull_state: ull.get_state().to_vec(),
-        })
-    } else {
-        match params.cuda_dedup_strategy {
-            CudaDedupStrategy::HashSet => {
-                scratch.sampled_hash_set.clear();
-                for &hash in &scratch.full_hashes {
-                    scratch.sampled_hash_set.insert(hash);
+        CudaDedupStrategy::SortUnstable => {
+            let cardinality_sketch = match cardinality_sketch {
+                CardinalitySketch::Ull(mut ull) => {
+                    update_cardinality(&scratch.full_hashes, |hash| {
+                        ull.add(hash);
+                    });
+                    CardinalitySketch::Ull(ull)
                 }
-                scratch
-                    .sampled_hashes
-                    .extend(scratch.sampled_hash_set.iter().copied());
-            }
-            CudaDedupStrategy::SortUnstable => {
-                scratch
-                    .sampled_hashes
-                    .extend(scratch.full_hashes.iter().copied());
-                scratch.sampled_hashes.sort_unstable();
-                scratch.sampled_hashes.dedup();
-            }
+                CardinalitySketch::Ell(mut ell) => {
+                    update_cardinality(&scratch.full_hashes, |hash| {
+                        ell.add_hash(hash);
+                    });
+                    CardinalitySketch::Ell(ell)
+                }
+            };
+            scratch.full_hashes.sort_unstable();
+            scratch.full_hashes.dedup();
+            std::mem::swap(&mut scratch.sampled_hashes, &mut scratch.full_hashes);
+            restore_full_hashes_after_hd = true;
+
+            cardinality_sketch
         }
-        None
     };
+    let cardinality_record = cardinality_sketch.into_record(params, sketch.file_str.clone());
     let hash_and_dedup_ns = hash_and_dedup_start.elapsed().as_nanos();
     metrics.hash_and_dedup_ns = hash_and_dedup_ns;
     metrics.cuda_filter_ns = Some(hash_and_dedup_ns);
@@ -545,9 +549,33 @@ fn sketch_one_file_cuda(
     Ok(IndexedSketchResult {
         index,
         sketch,
-        ull_record,
+        cardinality_record,
         metrics,
     })
+}
+
+#[cfg(feature = "cuda")]
+fn update_cardinality_and_hashset<F>(
+    full_hashes: &[u64],
+    sampled_hash_set: &mut HashSet<u64>,
+    mut add_cardinality_hash: F,
+) where
+    F: FnMut(u64),
+{
+    for &hash in full_hashes {
+        add_cardinality_hash(hash);
+        sampled_hash_set.insert(hash);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn update_cardinality<F>(full_hashes: &[u64], mut add_cardinality_hash: F)
+where
+    F: FnMut(u64),
+{
+    for &hash in full_hashes {
+        add_cardinality_hash(hash);
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -821,7 +849,7 @@ mod tests {
                 file_str: file.to_string(),
                 hv: Vec::new(),
             },
-            ull_record: Some(FileUllSketch {
+            cardinality_record: FileCardinalitySketch::Ull(FileUllSketch {
                 ksize: 21,
                 canonical: true,
                 seed: 123,

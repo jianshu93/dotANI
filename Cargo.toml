@@ -35,7 +35,6 @@ indexmap = "2.0.2"
 
 needletail = "0.5.1"
 rust-seq2kminmers = "0.1.0"
-
 wyhash = "0.5.0"
 t1ha = "0.1.0"
 
@@ -44,6 +43,7 @@ bloom = "0.3.2"
 bitpacking = "0.9.2"
 ndarray = "0.15.6"
 ultraloglog = "0.1.6"
+exaloglog = { package = "exaloglog-rs", git = "https://github.com/jianshu93/exaloglog.git", rev = "a2c8286368dd1674830ccc8c3ec6dd3a664e76a7" }
 
 [[bin]]
 name = "dotani"

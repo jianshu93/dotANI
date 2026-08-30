@@ -26,8 +26,8 @@ fn init_log() {
         .init();
 }
 
-fn ull_path_from_sketch_path(p: &PathBuf) -> PathBuf {
-    PathBuf::from(format!("{}.ull", p.to_string_lossy()))
+fn cardinality_path_from_sketch_path(p: &Path, estimator: types::CardinalityEstimator) -> PathBuf {
+    PathBuf::from(format!("{}.{}", p.to_string_lossy(), estimator.as_str()))
 }
 
 fn default_threads() -> usize {
@@ -163,11 +163,50 @@ fn run() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("ull")
+                .long("ull")
+                .help("Use UltraLogLog cardinality estimation (default)")
+                .conflicts_with("ell")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("ell")
+                .long("ell")
+                .help("Use ExaLogLog cardinality estimation")
+                .conflicts_with("ull")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("ull_p")
                 .long("ull-p")
                 .help("UltraLogLog precision parameter")
                 .default_value("14")
+                .conflicts_with("ell")
                 .value_parser(parse_ull_p)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ell_t")
+                .long("ell-t")
+                .help("ExaLogLog t parameter (default: 2)")
+                .requires("ell")
+                .value_parser(value_parser!(u32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ell_d")
+                .long("ell-d")
+                .help("ExaLogLog d parameter (default: 24)")
+                .requires("ell")
+                .value_parser(value_parser!(u32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ell_p")
+                .long("ell-p")
+                .help("ExaLogLog precision parameter (default: 12)")
+                .requires("ell")
+                .value_parser(value_parser!(u32))
                 .action(ArgAction::Set),
         )
         .arg(
@@ -220,6 +259,20 @@ fn run() -> Result<()> {
 
     let dist_cmd = Command::new(params::CMD_DIST)
         .about("Estimate ANI from reference and query sketch files")
+        .arg(
+            Arg::new("ull")
+                .long("ull")
+                .help("Load UltraLogLog cardinality sidecars (default)")
+                .conflicts_with("ell")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("ell")
+                .long("ell")
+                .help("Load ExaLogLog cardinality sidecars")
+                .conflicts_with("ull")
+                .action(ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("path_r")
                 .short('r')
@@ -296,6 +349,11 @@ fn run() -> Result<()> {
             .cloned()
             .unwrap_or_else(default_sketch_device);
         let max_readers = sketch_m.get_one::<usize>("max_readers").copied();
+        let cardinality_estimator = if sketch_m.get_flag("ell") {
+            types::CardinalityEstimator::Ell
+        } else {
+            types::CardinalityEstimator::Ull
+        };
 
         if device == "cuda" && !cuda_enabled() {
             bail!("--device cuda requires a binary built with --features cuda");
@@ -341,13 +399,19 @@ fn run() -> Result<()> {
             ),
             max_readers,
             device,
-            if_ull: true,
+            cardinality_estimator,
             ull_p: *sketch_m
                 .get_one::<u32>("ull_p")
                 .expect("clap guarantees ull-p has default"),
-            ull_out_file: ull_path_from_sketch_path(&out_file),
-            path_ref_ull: PathBuf::new(),
-            path_query_ull: PathBuf::new(),
+            ell_t: sketch_m.get_one::<u32>("ell_t").copied().unwrap_or(2),
+            ell_d: sketch_m.get_one::<u32>("ell_d").copied().unwrap_or(24),
+            ell_p: sketch_m.get_one::<u32>("ell_p").copied().unwrap_or(12),
+            cardinality_out_file: cardinality_path_from_sketch_path(
+                &out_file,
+                cardinality_estimator,
+            ),
+            path_ref_cardinality: PathBuf::new(),
+            path_query_cardinality: PathBuf::new(),
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
             dist_output_mode: types::DistOutputMode::Rows,
         };
@@ -384,6 +448,11 @@ fn run() -> Result<()> {
             .get_one::<PathBuf>("path_q")
             .cloned()
             .expect("clap guarantees --path-q is required");
+        let cardinality_estimator = if dist_m.get_flag("ell") {
+            types::CardinalityEstimator::Ell
+        } else {
+            types::CardinalityEstimator::Ull
+        };
         let threads = dist_m
             .get_one::<usize>("threads")
             .copied()
@@ -414,11 +483,20 @@ fn run() -> Result<()> {
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
             max_readers: None,
             device: String::from("cpu"),
-            if_ull: true,
+            cardinality_estimator,
             ull_p: 0,
-            ull_out_file: PathBuf::new(),
-            path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
-            path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
+            ell_t: 0,
+            ell_d: 0,
+            ell_p: 0,
+            cardinality_out_file: PathBuf::new(),
+            path_ref_cardinality: cardinality_path_from_sketch_path(
+                &path_ref_sketch,
+                cardinality_estimator,
+            ),
+            path_query_cardinality: cardinality_path_from_sketch_path(
+                &path_query_sketch,
+                cardinality_estimator,
+            ),
             metrics_out: None,
             dist_output_mode: types::DistOutputMode::from_cli_value(
                 dist_m

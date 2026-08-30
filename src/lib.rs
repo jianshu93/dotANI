@@ -1,3 +1,4 @@
+pub(crate) mod cardinality;
 pub mod dist;
 pub mod fastx_reader;
 pub mod hd;
@@ -79,6 +80,22 @@ mod tests {
     }
 
     #[test]
+    fn hd_encode_scalar_is_deterministic() {
+        let sketch = sketch_for_hv(1024);
+        let hashes = fixed_hashes();
+
+        let first = hd::encode_hash_hd(&hashes, &sketch);
+        let second = hd::encode_hash_hd(&hashes, &sketch);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1024);
+        assert_eq!(
+            dist::compute_hv_l2_norm(&first),
+            dist::compute_hv_l2_norm(&second)
+        );
+    }
+
+    #[test]
     fn wyrng_direct_seek_matches_sequential_chunks() {
         let hashes = representative_wyrng_hashes();
         let chunks = representative_wyrng_chunks();
@@ -146,22 +163,6 @@ mod tests {
 
         let actual = stream.clone_dtoh(&gpu_out).unwrap();
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn hd_encode_scalar_is_deterministic() {
-        let sketch = sketch_for_hv(1024);
-        let hashes = fixed_hashes();
-
-        let first = hd::encode_hash_hd(&hashes, &sketch);
-        let second = hd::encode_hash_hd(&hashes, &sketch);
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 1024);
-        assert_eq!(
-            dist::compute_hv_l2_norm(&first),
-            dist::compute_hv_l2_norm(&second)
-        );
     }
 
     #[cfg(feature = "cuda")]
@@ -334,18 +335,21 @@ mod tests {
 
     #[test]
     fn hd_encode_simd_matches_scalar_when_available() {
-        let sketch = sketch_for_hv(1024);
         let hashes = fixed_hashes();
-        let scalar = hd::encode_hash_hd(&hashes, &sketch);
 
-        if is_x86_feature_detected!("avx2") {
-            let avx2 = unsafe { hd::encode_hash_hd_avx2(&hashes, &sketch) };
-            assert_eq!(scalar, avx2);
-        }
+        for hv_d in [256, 1024] {
+            let sketch = sketch_for_hv(hv_d);
+            let scalar = hd::encode_hash_hd(&hashes, &sketch);
 
-        if is_x86_feature_detected!("avx512f") {
-            let avx512 = unsafe { hd::encode_hash_hd_avx512(&hashes, &sketch) };
-            assert_eq!(scalar, avx512);
+            if is_x86_feature_detected!("avx2") {
+                let avx2 = unsafe { hd::encode_hash_hd_avx2(&hashes, &sketch) };
+                assert_eq!(scalar, avx2);
+            }
+
+            if is_x86_feature_detected!("avx512f") {
+                let avx512 = unsafe { hd::encode_hash_hd_avx512(&hashes, &sketch) };
+                assert_eq!(scalar, avx512);
+            }
         }
     }
 

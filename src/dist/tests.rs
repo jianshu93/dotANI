@@ -332,6 +332,56 @@ fn valid_distance_inputs() -> (
     (refs, queries, ref_ull, query_ull)
 }
 
+#[test]
+fn distance_validation_rejects_counts_order_and_all_parameter_mismatches() {
+    let (refs, queries, ref_ull, query_ull) = valid_distance_inputs();
+    assert!(super::validate_distance_inputs(&refs, &queries, &ref_ull, &query_ull).is_ok());
+
+    assert!(super::validate_distance_inputs(&refs[..1], &queries, &ref_ull, &query_ull).is_err());
+
+    let mut wrong_ref_order = ref_ull.clone();
+    wrong_ref_order.swap(0, 1);
+    assert!(
+        super::validate_distance_inputs(&refs, &queries, &wrong_ref_order, &query_ull).is_err()
+    );
+
+    let mut wrong_query_order = query_ull.clone();
+    wrong_query_order.swap(0, 1);
+    assert!(
+        super::validate_distance_inputs(&refs, &queries, &ref_ull, &wrong_query_order).is_err()
+    );
+
+    for mismatch in 0..6 {
+        let bad_refs = refs.clone();
+        let mut bad_queries = queries.clone();
+        let bad_ref_ull = ref_ull.clone();
+        let mut bad_query_ull = query_ull.clone();
+        match mismatch {
+            0 => bad_queries[0].ksize = 2,
+            1 => bad_queries[0].canonical = false,
+            2 => bad_queries[0].seed = 999,
+            3 => bad_queries[0].scaled = 2,
+            4 => bad_queries[0].hv_d = 512,
+            5 => bad_query_ull[0].ull_p = 15,
+            _ => unreachable!(),
+        }
+        if mismatch == 5 {
+            bad_query_ull[0].ull_state = ultraloglog::UltraLogLog::new(15)
+                .unwrap()
+                .get_state()
+                .to_vec();
+        }
+        assert!(
+            super::validate_distance_inputs(&bad_refs, &bad_queries, &bad_ref_ull, &bad_query_ull,)
+                .is_err()
+        );
+    }
+
+    let mut bad_ref_ull = ref_ull;
+    bad_ref_ull[0].ksize = 2;
+    assert!(super::validate_distance_inputs(&refs, &queries, &bad_ref_ull, &query_ull).is_err());
+}
+
 fn read_rows_as_set(path: &std::path::Path) -> HashSet<String> {
     std::fs::read_to_string(path)
         .expect("failed to read ANI output")
@@ -771,6 +821,64 @@ fn gpu_stream_normal_threshold_matches_expected_rows_as_set() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn gpu_stream_count_mode_matches_rows_hit_count() {
+    let refs = vec![
+        test_filesketch("r0", vec![4, 0, 0, 0]),
+        test_filesketch("r1", vec![0, 4, 0, 0]),
+    ];
+    let queries = vec![
+        test_filesketch("q0", vec![90, 0, 0, 0]),
+        test_filesketch("q1", vec![0, 90, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0];
+    let out = temp_ani_path("gpu_rows_count_compare");
+    let pb = indicatif::ProgressBar::hidden();
+    let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+    let row_hits = stream_hv_ani_gpu_multi(
+        Some(&mut writer),
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        1,
+        DistOutputMode::Rows,
+    )
+    .expect("GPU stream should compute rows");
+    writer.flush().expect("failed to flush output");
+    let row_count = std::fs::read_to_string(&out)
+        .expect("failed to read rows output")
+        .lines()
+        .count();
+
+    let count_hits = stream_hv_ani_gpu_multi(
+        None,
+        &pb,
+        &refs,
+        &queries,
+        &cards,
+        &cards,
+        1,
+        false,
+        85.0,
+        1,
+        DistOutputMode::Count,
+    )
+    .expect("GPU stream should compute count");
+
+    assert_eq!(row_hits, 2);
+    assert_eq!(row_count, row_hits);
+    assert_eq!(count_hits, row_hits);
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn gpu_stream_symmetric_resident_path_matches_expected_rows_as_set() {
     let sketches = vec![
         test_filesketch("s0", vec![4, 0, 0, 0]),
@@ -807,6 +915,61 @@ fn gpu_stream_symmetric_resident_path_matches_expected_rows_as_set() {
             "s1\ts2\t0.000".to_string(),
         ])
     );
+
+    let _ = std::fs::remove_file(out);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_stream_symmetric_count_mode_matches_rows_hit_count() {
+    let sketches = vec![
+        test_filesketch("s0", vec![4, 0, 0, 0]),
+        test_filesketch("s1", vec![0, 4, 0, 0]),
+        test_filesketch("s2", vec![4, 0, 0, 0]),
+    ];
+    let cards = vec![100.0, 100.0, 100.0];
+    let out = temp_ani_path("gpu_symmetric_rows_count_compare");
+    let pb = indicatif::ProgressBar::hidden();
+    let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+    let row_hits = stream_hv_ani_gpu_multi(
+        Some(&mut writer),
+        &pb,
+        &sketches,
+        &sketches,
+        &cards,
+        &cards,
+        1,
+        true,
+        0.0,
+        1,
+        DistOutputMode::Rows,
+    )
+    .expect("GPU symmetric rows should compute");
+    writer.flush().expect("failed to flush output");
+    let row_count = std::fs::read_to_string(&out)
+        .expect("failed to read rows output")
+        .lines()
+        .count();
+
+    let count_hits = stream_hv_ani_gpu_multi(
+        None,
+        &pb,
+        &sketches,
+        &sketches,
+        &cards,
+        &cards,
+        1,
+        true,
+        0.0,
+        1,
+        DistOutputMode::Count,
+    )
+    .expect("GPU symmetric count should compute");
+
+    assert_eq!(row_hits, 3);
+    assert_eq!(row_count, row_hits);
+    assert_eq!(count_hits, row_hits);
 
     let _ = std::fs::remove_file(out);
 }

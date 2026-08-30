@@ -21,18 +21,21 @@ pub fn mm_hash(bytes: &[u8]) -> usize {
 #[inline]
 pub fn mm_hash64(kmer: u64) -> u64 {
     let mut key = kmer;
-    key = !key + (key << 21);
+    key = (!key).wrapping_add(key << 21);
     key = key ^ key >> 24;
-    key = (key + (key << 3)) + (key << 8);
+    key = (key.wrapping_add(key << 3)).wrapping_add(key << 8);
     key = key ^ key >> 14;
-    key = (key + (key << 2)) + (key << 4);
+    key = (key.wrapping_add(key << 2)).wrapping_add(key << 4);
     key = key ^ key >> 28;
-    key = key + (key << 31);
+    key = key.wrapping_add(key << 31);
     key
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// The caller must execute this function only when AVX2 is available.
 pub unsafe fn mm_hash64_avx2(kmer: __m256i) -> __m256i {
     let mut key = kmer;
     let s1 = _mm256_slli_epi64(key, 21);
@@ -81,14 +84,78 @@ pub struct CliParams {
     pub cuda_dedup_strategy: CudaDedupStrategy,
     pub max_readers: Option<usize>,
 
-    pub if_ull: bool,
+    pub cardinality_estimator: CardinalityEstimator,
     pub ull_p: u32,
-    pub ull_out_file: PathBuf,
-    pub path_ref_ull: PathBuf,
-    pub path_query_ull: PathBuf,
+    pub ell_t: u32,
+    pub ell_d: u32,
+    pub ell_p: u32,
+    pub cardinality_out_file: PathBuf,
+    pub path_ref_cardinality: PathBuf,
+    pub path_query_cardinality: PathBuf,
 
     pub metrics_out: Option<PathBuf>,
     pub dist_output_mode: DistOutputMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardinalityEstimator {
+    Ull,
+    Ell,
+}
+
+impl CardinalityEstimator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ull => "ull",
+            Self::Ell => "ell",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaDedupStrategy {
+    HashSet,
+    SortUnstable,
+}
+
+impl CudaDedupStrategy {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "hashset" => Self::HashSet,
+            "sort_unstable" => Self::SortUnstable,
+            _ => panic!("invalid CUDA dedup strategy {value:?}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HashSet => "hashset",
+            Self::SortUnstable => "sort_unstable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistOutputMode {
+    Rows,
+    Count,
+}
+
+impl DistOutputMode {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "rows" => Self::Rows,
+            "count" => Self::Count,
+            _ => panic!("invalid dist output mode {value:?}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Count => "count",
+        }
+    }
 }
 
 pub struct SketchParams {
@@ -108,9 +175,12 @@ pub struct SketchParams {
     pub cuda_dedup_strategy: CudaDedupStrategy,
     pub max_readers: Option<usize>,
 
-    pub if_ull: bool,
+    pub cardinality_estimator: CardinalityEstimator,
     pub ull_p: u32,
-    pub ull_out_file: PathBuf,
+    pub ell_t: u32,
+    pub ell_d: u32,
+    pub ell_p: u32,
+    pub cardinality_out_file: PathBuf,
     pub metrics_out: Option<PathBuf>,
 }
 
@@ -133,9 +203,12 @@ impl Default for SketchParams {
             cuda_dedup_strategy: CudaDedupStrategy::SortUnstable,
             max_readers: None,
 
-            if_ull: false,
+            cardinality_estimator: CardinalityEstimator::Ull,
             ull_p: 14,
-            ull_out_file: PathBuf::new(),
+            ell_t: 2,
+            ell_d: 24,
+            ell_p: 12,
+            cardinality_out_file: PathBuf::new(),
             metrics_out: None,
         }
     }
@@ -160,13 +233,22 @@ impl SketchParams {
         new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
         new_sketch.max_readers = params.max_readers;
 
-        new_sketch.if_ull = params.if_ull;
+        new_sketch.cardinality_estimator = params.cardinality_estimator;
         new_sketch.ull_p = params.ull_p;
-        new_sketch.ull_out_file = params.ull_out_file.clone();
+        new_sketch.ell_t = params.ell_t;
+        new_sketch.ell_d = params.ell_d;
+        new_sketch.ell_p = params.ell_p;
+        new_sketch.cardinality_out_file = params.cardinality_out_file.clone();
         new_sketch.metrics_out = params.metrics_out.clone();
 
         new_sketch
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SketchInput {
+    pub read_path: PathBuf,
+    pub file_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -205,60 +287,8 @@ pub struct FileSketchMetrics {
     pub cuda_hd_d2h_event_ns: Option<u128>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CudaDedupStrategy {
-    HashSet,
-    SortUnstable,
-}
-
-impl CudaDedupStrategy {
-    pub fn from_cli_value(value: &str) -> Self {
-        match value {
-            "hashset" => Self::HashSet,
-            "sort_unstable" => Self::SortUnstable,
-            _ => panic!("invalid CUDA dedup strategy {value:?}"),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HashSet => "hashset",
-            Self::SortUnstable => "sort_unstable",
-        }
-    }
-}
-
 pub(crate) fn hash_passes_threshold(hash: u64, threshold: u64) -> bool {
     threshold == u64::MAX || hash < threshold
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DistOutputMode {
-    Rows,
-    Count,
-}
-
-impl DistOutputMode {
-    pub fn from_cli_value(value: &str) -> Self {
-        match value {
-            "rows" => Self::Rows,
-            "count" => Self::Count,
-            _ => panic!("invalid dist output mode {value:?}"),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rows => "rows",
-            Self::Count => "count",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SketchInput {
-    pub read_path: PathBuf,
-    pub file_id: String,
 }
 
 pub struct Sketch {
@@ -319,7 +349,7 @@ impl Sketch {
             _ => t1ha::t1ha2_atonce(kmer, self.seed),
         };
 
-        if h < self.threshold {
+        if hash_passes_threshold(h, self.threshold) {
             self.hash_set.insert(h);
         }
     }
@@ -331,21 +361,24 @@ impl Sketch {
             _ => t1ha::t1ha2_atonce(&kmer.to_be_bytes(), 123),
         };
 
-        if h < self.threshold {
+        if hash_passes_threshold(h, self.threshold) {
             self.hash_set.insert(h);
         }
     }
 
+    /// # Safety
+    ///
+    /// The caller must execute this function only when AVX2 is available.
     pub unsafe fn insert_kmer_u64_avx2(&mut self, kmer: __m256i) {
-        let hash_256 = mm_hash64_avx2(kmer);
+        let hash_256 = unsafe { mm_hash64_avx2(kmer) };
 
-        let h1 = _mm256_extract_epi64(hash_256, 0) as u64;
-        let h2 = _mm256_extract_epi64(hash_256, 1) as u64;
-        let h3 = _mm256_extract_epi64(hash_256, 2) as u64;
-        let h4 = _mm256_extract_epi64(hash_256, 3) as u64;
+        let h1 = unsafe { _mm256_extract_epi64(hash_256, 0) as u64 };
+        let h2 = unsafe { _mm256_extract_epi64(hash_256, 1) as u64 };
+        let h3 = unsafe { _mm256_extract_epi64(hash_256, 2) as u64 };
+        let h4 = unsafe { _mm256_extract_epi64(hash_256, 3) as u64 };
 
         for h in [h1, h2, h3, h4] {
-            if h > 0 && h < self.threshold {
+            if hash_passes_threshold(h, self.threshold) {
                 self.hash_set.insert(h);
             }
         }
@@ -375,11 +408,29 @@ pub struct FileUllSketch {
     pub ull_state: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct FileEllSketch {
+    pub ksize: u8,
+    pub canonical: bool,
+    pub seed: u64,
+    pub ell_t: u32,
+    pub ell_d: u32,
+    pub file_str: String,
+    pub ell_state: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub(crate) enum FileCardinalitySketch {
+    Ull(FileUllSketch),
+    Ell(FileEllSketch),
+}
+
 pub struct SketchDist {
     pub path_ref_sketch: PathBuf,
     pub path_query_sketch: PathBuf,
-    pub path_ref_ull: PathBuf,
-    pub path_query_ull: PathBuf,
+    pub cardinality_estimator: CardinalityEstimator,
+    pub path_ref_cardinality: PathBuf,
+    pub path_query_cardinality: PathBuf,
     pub out_file: PathBuf,
     pub ksize: u8,
     pub hv_d: usize,
@@ -394,8 +445,9 @@ impl Default for SketchDist {
         SketchDist {
             path_ref_sketch: PathBuf::new(),
             path_query_sketch: PathBuf::new(),
-            path_ref_ull: PathBuf::new(),
-            path_query_ull: PathBuf::new(),
+            cardinality_estimator: CardinalityEstimator::Ull,
+            path_ref_cardinality: PathBuf::new(),
+            path_query_cardinality: PathBuf::new(),
             out_file: PathBuf::new(),
             ksize: 21,
             hv_d: 1024,
@@ -412,8 +464,9 @@ impl SketchDist {
         let mut new_dist = SketchDist::default();
         new_dist.path_ref_sketch = params.path_ref_sketch.clone();
         new_dist.path_query_sketch = params.path_query_sketch.clone();
-        new_dist.path_ref_ull = params.path_ref_ull.clone();
-        new_dist.path_query_ull = params.path_query_ull.clone();
+        new_dist.cardinality_estimator = params.cardinality_estimator;
+        new_dist.path_ref_cardinality = params.path_ref_cardinality.clone();
+        new_dist.path_query_cardinality = params.path_query_cardinality.clone();
         new_dist.out_file = params.out_file.clone();
         new_dist.ksize = params.ksize;
         new_dist.hv_d = params.hv_d;

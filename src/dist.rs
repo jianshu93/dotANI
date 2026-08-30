@@ -1,3 +1,4 @@
+use exaloglog::ExaLogLog;
 use ultraloglog::UltraLogLog;
 
 use crate::hd;
@@ -30,6 +31,41 @@ use std::arch::x86_64::*;
 #[cfg(feature = "cuda")]
 use crate::cuda_dot::{GpuDotExecutor, device_count};
 
+enum CardinalitySketches {
+    Ull(Vec<FileUllSketch>),
+    Ell(Vec<FileEllSketch>),
+}
+
+impl CardinalitySketches {
+    fn load(estimator: CardinalityEstimator, path: &std::path::Path) -> Result<Self> {
+        match estimator {
+            CardinalityEstimator::Ull => utils::load_ull_sketch(path).map(Self::Ull),
+            CardinalityEstimator::Ell => utils::load_ell_sketch(path).map(Self::Ell),
+        }
+    }
+
+    fn into_cardinalities(self) -> Vec<f64> {
+        match self {
+            Self::Ull(records) => records
+                .into_par_iter()
+                .map(|record| {
+                    UltraLogLog::wrap(record.ull_state)
+                        .expect("ULL state was validated during loading")
+                        .get_distinct_count_estimate()
+                })
+                .collect(),
+            Self::Ell(records) => records
+                .into_par_iter()
+                .map(|record| {
+                    ExaLogLog::wrap(record.ell_t, record.ell_d, record.ell_state)
+                        .expect("ELL state was validated during loading")
+                        .get_distinct_count_estimate()
+                })
+                .collect(),
+        }
+    }
+}
+
 pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
     if !sketch_dist.ani_threshold.is_finite() || !(0.0..=100.0).contains(&sketch_dist.ani_threshold)
     {
@@ -45,87 +81,75 @@ pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
-    let ull_load_start = Instant::now();
-    let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path())?;
-    let query_ull_sketch = if if_sym {
-        ref_ull_sketch.clone()
+    let cardinality_load_start = Instant::now();
+    let ref_cardinality_sketch = CardinalitySketches::load(
+        sketch_dist.cardinality_estimator,
+        sketch_dist.path_ref_cardinality.as_path(),
+    )?;
+    let query_cardinality_sketch_storage = if if_sym {
+        None
     } else {
-        utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())?
+        Some(CardinalitySketches::load(
+            sketch_dist.cardinality_estimator,
+            sketch_dist.path_query_cardinality.as_path(),
+        )?)
     };
-    let ull_load_secs = ull_load_start.elapsed().as_secs_f32();
+    let cardinality_load_secs = cardinality_load_start.elapsed().as_secs_f32();
 
     let sketch_load_start = Instant::now();
     let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path())?;
-    let mut query_file_sketch = if if_sym {
-        ref_file_sketch.clone()
+    let mut query_file_sketch_storage = if if_sym {
+        None
     } else {
-        utils::load_sketch(sketch_dist.path_query_sketch.as_path())?
+        Some(utils::load_sketch(sketch_dist.path_query_sketch.as_path())?)
     };
     let sketch_load_secs = sketch_load_start.elapsed().as_secs_f32();
 
     let validation_start = Instant::now();
+    let ksize_ref;
+    {
+        let query_cardinality_sketch = query_cardinality_sketch_storage
+            .as_ref()
+            .unwrap_or(&ref_cardinality_sketch);
+        let query_file_sketch: &[FileSketch] = query_file_sketch_storage
+            .as_deref()
+            .unwrap_or(&ref_file_sketch);
 
-    assert_eq!(
-        ref_file_sketch.len(),
-        ref_ull_sketch.len(),
-        "Ref HD and ULL sketch counts differ"
-    );
-    assert_eq!(
-        query_file_sketch.len(),
-        query_ull_sketch.len(),
-        "Query HD and ULL sketch counts differ"
-    );
-
-    for i in 0..ref_file_sketch.len() {
-        assert_eq!(
-            ref_file_sketch[i].file_str, ref_ull_sketch[i].file_str,
-            "Ref HD/ULL file order mismatch"
-        );
+        ksize_ref = validate_cardinality_distance_inputs(
+            &ref_file_sketch,
+            query_file_sketch,
+            &ref_cardinality_sketch,
+            query_cardinality_sketch,
+        )?;
     }
-    for i in 0..query_file_sketch.len() {
-        assert_eq!(
-            query_file_sketch[i].file_str, query_ull_sketch[i].file_str,
-            "Query HD/ULL file order mismatch"
-        );
-    }
-
-    let ksize_ref = ref_file_sketch[0].ksize;
-    let ksize_query = query_file_sketch[0].ksize;
-    assert_eq!(
-        ksize_ref, ksize_query,
-        "Ref and query sketches use different kmer sizes!"
-    );
-
-    let hv_d_ref = ref_file_sketch[0].hv_d;
-    let hv_d_query = query_file_sketch[0].hv_d;
-    assert_eq!(
-        hv_d_ref, hv_d_query,
-        "Ref and query sketches use different HV dimensions!"
-    );
-
     let validation_secs = validation_start.elapsed().as_secs_f32();
 
     let decompress_start = Instant::now();
     hd::decompress_file_sketch(&mut ref_file_sketch)?;
-    hd::decompress_file_sketch(&mut query_file_sketch)?;
+    if let Some(query_file_sketch) = query_file_sketch_storage.as_mut() {
+        hd::decompress_file_sketch(query_file_sketch)?;
+    }
     let decompress_secs = decompress_start.elapsed().as_secs_f32();
 
-    let compute_start = Instant::now();
+    let query_file_sketch: &[FileSketch] = query_file_sketch_storage
+        .as_deref()
+        .unwrap_or(&ref_file_sketch);
 
+    let compute_start = Instant::now();
     compute_hv_ani(
         sketch_dist,
         &ref_file_sketch,
-        &query_file_sketch,
-        &ref_ull_sketch,
-        &query_ull_sketch,
+        query_file_sketch,
+        ref_cardinality_sketch,
+        query_cardinality_sketch_storage,
         ksize_ref,
         if_sym,
     )?;
     let compute_secs = compute_start.elapsed().as_secs_f32();
 
     debug!(
-        "dist phase timings: ull_load={:.3}s sketch_load={:.3}s validation={:.3}s decompress={:.3}s compute_write={:.3}s",
-        ull_load_secs, sketch_load_secs, validation_secs, decompress_secs, compute_secs,
+        "dist phase timings: cardinality_load={:.3}s sketch_load={:.3}s validation={:.3}s decompress={:.3}s compute_write={:.3}s",
+        cardinality_load_secs, sketch_load_secs, validation_secs, decompress_secs, compute_secs,
     );
     info!(
         "dist total={:.3}s refs={} queries={}",
@@ -133,8 +157,192 @@ pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
         ref_file_sketch.len(),
         query_file_sketch.len()
     );
-
     Ok(())
+}
+
+trait CardinalityRecord {
+    fn file_str(&self) -> &str;
+    fn ksize(&self) -> u8;
+    fn canonical(&self) -> bool;
+    fn seed(&self) -> u64;
+    fn estimator_params_match(&self, other: &Self) -> bool;
+    fn estimator_name() -> &'static str;
+}
+
+impl CardinalityRecord for FileUllSketch {
+    fn file_str(&self) -> &str {
+        &self.file_str
+    }
+
+    fn ksize(&self) -> u8 {
+        self.ksize
+    }
+
+    fn canonical(&self) -> bool {
+        self.canonical
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    fn estimator_params_match(&self, other: &Self) -> bool {
+        self.ull_p == other.ull_p
+    }
+
+    fn estimator_name() -> &'static str {
+        "ULL"
+    }
+}
+
+impl CardinalityRecord for FileEllSketch {
+    fn file_str(&self) -> &str {
+        &self.file_str
+    }
+
+    fn ksize(&self) -> u8 {
+        self.ksize
+    }
+
+    fn canonical(&self) -> bool {
+        self.canonical
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    fn estimator_params_match(&self, other: &Self) -> bool {
+        self.ell_t == other.ell_t
+            && self.ell_d == other.ell_d
+            && self.ell_state.len() == other.ell_state.len()
+    }
+
+    fn estimator_name() -> &'static str {
+        "ELL"
+    }
+}
+
+fn validate_cardinality_distance_inputs(
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cardinality: &CardinalitySketches,
+    query_cardinality: &CardinalitySketches,
+) -> Result<u8> {
+    match (ref_cardinality, query_cardinality) {
+        (CardinalitySketches::Ull(ref_records), CardinalitySketches::Ull(query_records)) => {
+            validate_distance_inputs(ref_filesketch, query_filesketch, ref_records, query_records)
+        }
+        (CardinalitySketches::Ell(ref_records), CardinalitySketches::Ell(query_records)) => {
+            validate_distance_inputs(ref_filesketch, query_filesketch, ref_records, query_records)
+        }
+        _ => bail!("reference and query cardinality estimator types differ"),
+    }
+}
+
+fn validate_distance_inputs<C: CardinalityRecord>(
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cardinality: &[C],
+    query_cardinality: &[C],
+) -> Result<u8> {
+    if ref_filesketch.is_empty() || query_filesketch.is_empty() {
+        bail!("HD sketch collections must be nonempty");
+    }
+    if ref_cardinality.is_empty() || query_cardinality.is_empty() {
+        bail!(
+            "{} sketch collections must be nonempty",
+            C::estimator_name()
+        );
+    }
+    if ref_filesketch.len() != ref_cardinality.len() {
+        bail!(
+            "reference HD/{} counts differ: {} vs {}",
+            C::estimator_name(),
+            ref_filesketch.len(),
+            ref_cardinality.len()
+        );
+    }
+    if query_filesketch.len() != query_cardinality.len() {
+        bail!(
+            "query HD/{} counts differ: {} vs {}",
+            C::estimator_name(),
+            query_filesketch.len(),
+            query_cardinality.len()
+        );
+    }
+
+    for (index, (hd, cardinality)) in ref_filesketch.iter().zip(ref_cardinality).enumerate() {
+        if hd.file_str != cardinality.file_str() {
+            bail!(
+                "reference HD/{} file order mismatch at record {index}",
+                C::estimator_name()
+            );
+        }
+        if hd.ksize != cardinality.ksize()
+            || hd.canonical != cardinality.canonical()
+            || hd.seed != cardinality.seed()
+        {
+            bail!(
+                "reference HD/{} metadata mismatch at record {index}",
+                C::estimator_name()
+            );
+        }
+        if !ref_cardinality[0].estimator_params_match(cardinality) {
+            bail!(
+                "reference {} parameters differ at record {index}",
+                C::estimator_name()
+            );
+        }
+    }
+    for (index, (hd, cardinality)) in query_filesketch.iter().zip(query_cardinality).enumerate() {
+        if hd.file_str != cardinality.file_str() {
+            bail!(
+                "query HD/{} file order mismatch at record {index}",
+                C::estimator_name()
+            );
+        }
+        if hd.ksize != cardinality.ksize()
+            || hd.canonical != cardinality.canonical()
+            || hd.seed != cardinality.seed()
+        {
+            bail!(
+                "query HD/{} metadata mismatch at record {index}",
+                C::estimator_name()
+            );
+        }
+        if !query_cardinality[0].estimator_params_match(cardinality) {
+            bail!(
+                "query {} parameters differ at record {index}",
+                C::estimator_name()
+            );
+        }
+    }
+
+    let ref_hd = &ref_filesketch[0];
+    let query_hd = &query_filesketch[0];
+    let ref_cardinality_first = &ref_cardinality[0];
+    let query_cardinality_first = &query_cardinality[0];
+    if ref_hd.ksize != query_hd.ksize
+        || ref_hd.canonical != query_hd.canonical
+        || ref_hd.seed != query_hd.seed
+        || ref_hd.scaled != query_hd.scaled
+        || ref_hd.hv_d != query_hd.hv_d
+    {
+        bail!("reference and query sketch parameters are incompatible");
+    }
+    if ref_cardinality_first.ksize() != query_cardinality_first.ksize()
+        || ref_cardinality_first.canonical() != query_cardinality_first.canonical()
+        || ref_cardinality_first.seed() != query_cardinality_first.seed()
+        || !ref_cardinality_first.estimator_params_match(query_cardinality_first)
+    {
+        bail!(
+            "reference and query {} parameters are incompatible",
+            C::estimator_name()
+        );
+    }
+
+    Ok(ref_hd.ksize)
 }
 
 pub fn compute_hv_l2_norm(hv: &[i32]) -> i64 {
@@ -1452,12 +1660,12 @@ fn write_count_summary(
     Ok(())
 }
 
-pub fn compute_hv_ani(
+fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
     ref_filesketch: &[FileSketch],
     query_filesketch: &[FileSketch],
-    ref_ull_sketch: &[FileUllSketch],
-    query_ull_sketch: &[FileUllSketch],
+    ref_cardinality_sketch: CardinalitySketches,
+    query_cardinality_sketch: Option<CardinalitySketches>,
     ksize: u8,
     if_symmetric: bool,
 ) -> Result<()> {
@@ -1474,21 +1682,10 @@ pub fn compute_hv_ani(
 
     let pb = utils::get_progress_bar(num_dists);
 
-    let compute_start = Instant::now();
     let cardinality_start = Instant::now();
-    let ref_cards: Vec<f64> = ref_ull_sketch
-        .par_iter()
-        .map(|s| ull_cardinality_from_state(&s.ull_state))
-        .collect();
-
-    let query_cards: Vec<f64> = if if_symmetric {
-        ref_cards.clone()
-    } else {
-        query_ull_sketch
-            .par_iter()
-            .map(|s| ull_cardinality_from_state(&s.ull_state))
-            .collect()
-    };
+    let ref_cards = ref_cardinality_sketch.into_cardinalities();
+    let query_cards_storage = query_cardinality_sketch.map(CardinalitySketches::into_cardinalities);
+    let query_cards = query_cards_storage.as_deref().unwrap_or(&ref_cards);
     let cardinality_secs = cardinality_start.elapsed().as_secs_f32();
 
     let stream_start = Instant::now();
@@ -1514,7 +1711,7 @@ pub fn compute_hv_ani(
             ref_filesketch,
             query_filesketch,
             &ref_cards,
-            &query_cards,
+            query_cards,
             ksize,
             if_symmetric,
             sketch_dist.ani_threshold,
@@ -1538,7 +1735,7 @@ pub fn compute_hv_ani(
             ref_filesketch,
             query_filesketch,
             &ref_cards,
-            &query_cards,
+            query_cards,
             ksize,
             if_symmetric,
             sketch_dist.ani_threshold,
@@ -1573,7 +1770,6 @@ pub fn compute_hv_ani(
             sketch_dist.out_file.to_string_lossy()
         );
     }
-
     if sketch_dist.output_mode == DistOutputMode::Count {
         write_count_summary(
             sketch_dist.out_file.as_path(),

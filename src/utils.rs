@@ -105,7 +105,9 @@ pub(crate) fn validate_sketch_params(params: &SketchParams) -> Result<()> {
         );
     }
     hd::validate_hv_dimension(params.hv_d)?;
-    if !(3..=26).contains(&params.ull_p) {
+    if params.cardinality_estimator == CardinalityEstimator::Ull
+        && !(3..=26).contains(&params.ull_p)
+    {
         bail!("ULL precision must be in 3..=26 (found {})", params.ull_p);
     }
     if params.out_file.as_os_str().is_empty() {
@@ -282,6 +284,10 @@ pub fn dump_ull_sketch(file_ull_sketch: &[FileUllSketch], out_file_path: &Path) 
     dump_compressed_cardinality_sketch(file_ull_sketch, out_file_path, "ULL")
 }
 
+pub fn dump_ell_sketch(file_ell_sketch: &[FileEllSketch], out_file_path: &Path) -> Result<()> {
+    dump_compressed_cardinality_sketch(file_ell_sketch, out_file_path, "ELL")
+}
+
 fn dump_compressed_cardinality_sketch<T: Serialize>(
     records: &[T],
     out_file_path: &Path,
@@ -340,6 +346,39 @@ fn dump_compressed_cardinality_sketch<T: Serialize>(
         n_threads
     );
     Ok(())
+}
+
+pub(crate) fn dump_cardinality_sketch(
+    records: Vec<FileCardinalitySketch>,
+    estimator: CardinalityEstimator,
+    out_file_path: &Path,
+) -> Result<()> {
+    match estimator {
+        CardinalityEstimator::Ull => {
+            let records = records
+                .into_iter()
+                .map(|record| match record {
+                    FileCardinalitySketch::Ull(record) => Ok(record),
+                    FileCardinalitySketch::Ell(_) => {
+                        Err(anyhow!("ELL record found in ULL sketch output"))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            dump_ull_sketch(&records, out_file_path)
+        }
+        CardinalityEstimator::Ell => {
+            let records = records
+                .into_iter()
+                .map(|record| match record {
+                    FileCardinalitySketch::Ell(record) => Ok(record),
+                    FileCardinalitySketch::Ull(_) => {
+                        Err(anyhow!("ULL record found in ELL sketch output"))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            dump_ell_sketch(&records, out_file_path)
+        }
+    }
 }
 
 pub fn dump_sketch_metrics(
@@ -564,6 +603,43 @@ fn validate_ull_sketch(sketch: &FileUllSketch, label: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_ell_sketches(sketches: &[FileEllSketch], label: &str) -> Result<()> {
+    if sketches.is_empty() {
+        bail!("{label} collection is empty");
+    }
+
+    let first = &sketches[0];
+    validate_ell_sketch(first, &format!("{label} record 0"))?;
+    for (index, sketch) in sketches.iter().enumerate().skip(1) {
+        validate_ell_sketch(sketch, &format!("{label} record {index}"))?;
+        if sketch.ksize != first.ksize
+            || sketch.canonical != first.canonical
+            || sketch.seed != first.seed
+            || sketch.ell_t != first.ell_t
+            || sketch.ell_d != first.ell_d
+            || sketch.ell_state.len() != first.ell_state.len()
+        {
+            bail!(
+                "{label} record {index} has inconsistent ksize, canonical, seed, ell_t, ell_d, or precision"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_ell_sketch(sketch: &FileEllSketch, label: &str) -> Result<()> {
+    if sketch.file_str.is_empty() {
+        bail!("{label} has an empty file identifier");
+    }
+    if sketch.ksize == 0 {
+        bail!("{label} has invalid ksize 0");
+    }
+    exaloglog::ExaLogLog::wrap(sketch.ell_t, sketch.ell_d, sketch.ell_state.clone())
+        .map_err(|e| anyhow!("{label} has invalid ELL state: {e}"))?;
+    Ok(())
+}
+
 fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
     match (left, right) {
         (Some(a), Some(b)) => Some(a + b),
@@ -656,6 +732,18 @@ pub fn load_ull_sketch(path: &Path) -> Result<Vec<FileUllSketch>> {
     );
 }
 
+pub fn load_ell_sketch(path: &Path) -> Result<Vec<FileEllSketch>> {
+    info!("Loading ELL sketch from {}", path.display());
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read ELL sketch file {}", path.display()))?;
+    let serialized = zstd::stream::decode_all(bytes.as_slice())
+        .with_context(|| format!("failed to decompress ELL sketch file {}", path.display()))?;
+    let sketches = bincode::deserialize::<Vec<FileEllSketch>>(&serialized[..])
+        .with_context(|| format!("failed to decode ELL sketch file {}", path.display()))?;
+    validate_ell_sketches(&sketches, &format!("ELL sketch file {}", path.display()))?;
+    Ok(sketches)
+}
+
 pub fn dump_ani_file(sketch_dist: &SketchDist) {
     let mut indices = (0..sketch_dist.file_ani.len()).collect::<Vec<_>>();
     indices.sort_by(|&i1, &i2| {
@@ -730,6 +818,7 @@ pub fn dump_distribution_to_txt(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exaloglog::ExaLogLog;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_dir(name: &str) -> PathBuf {
@@ -994,5 +1083,39 @@ mod tests {
         assert!(load_ull_sketch(&inconsistent_ull_path).is_err());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ell_dump_load_wrap_round_trip() {
+        let dir = test_dir("ell_round_trip");
+        let path = dir.join("test.ell");
+        let mut ell = ExaLogLog::new(2, 24, 12).unwrap();
+        for hash in [0, 1, 2, 3, 5, 8, 13, 21, u64::MAX] {
+            ell.add_hash(hash);
+        }
+        let expected_state = ell.state().to_vec();
+        let expected_estimate = ell.estimate();
+        let records = vec![FileEllSketch {
+            ksize: 16,
+            canonical: true,
+            seed: 1447,
+            ell_t: 2,
+            ell_d: 24,
+            file_str: String::from("test.fna"),
+            ell_state: expected_state.clone(),
+        }];
+
+        dump_ell_sketch(&records, &path).unwrap();
+        let loaded = load_ell_sketch(&path).unwrap();
+        let wrapped = ExaLogLog::wrap(
+            loaded[0].ell_t,
+            loaded[0].ell_d,
+            loaded[0].ell_state.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded, records);
+        assert_eq!(wrapped.state(), expected_state);
+        assert_eq!(wrapped.estimate(), expected_estimate);
     }
 }

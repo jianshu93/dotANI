@@ -94,57 +94,60 @@ fn cli_help_defaults() {
 }
 
 #[test]
-fn valid_hv_dimensions_round_trip_and_count_output_mode() {
-    let dir = TestDir::new("roundtrip");
+fn ull_and_ell_cli_round_trip() {
+    let dir = TestDir::new("cardinality-roundtrip");
     let inputs = dir.path().join("inputs");
     fs::create_dir_all(&inputs).unwrap();
     write_valid_fasta(&inputs);
+    fs::write(
+        inputs.join("second.fna"),
+        b">record-2\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAAAA\n",
+    )
+    .unwrap();
 
-    for hv_d in ["256", "1024", "4096"] {
-        let output = dir.path().join(format!("{hv_d}.sketch"));
+    for (flag, extension) in [("--ull", "ull"), ("--ell", "ell")] {
+        let sketch_path = dir.path().join(format!("{extension}.sketch"));
         let sketch = run([
             "sketch",
             "--path",
             inputs.to_str().unwrap(),
             "--out",
-            output.to_str().unwrap(),
+            sketch_path.to_str().unwrap(),
             "--device",
             "cpu",
             "--ksize",
             "3",
             "--hv-d",
-            hv_d,
-            "--canonical",
-            "false",
+            "256",
+            flag,
         ]);
         assert_success(&sketch);
-        assert!(output.is_file());
-        assert!(PathBuf::from(format!("{}.ull", output.display())).is_file());
-    }
 
-    let output = dir.path().join("256.sketch");
-    let ani_output = dir.path().join("count.tsv");
-    let dist = run([
-        "dist",
-        "--path-r",
-        output.to_str().unwrap(),
-        "--path-q",
-        output.to_str().unwrap(),
-        "--out",
-        ani_output.to_str().unwrap(),
-        "--output-mode",
-        "count",
-        "--ani-th",
-        "0",
-        "--threads",
-        "1",
-    ]);
-    assert_success(&dist);
-    assert!(
-        fs::read_to_string(ani_output)
-            .unwrap()
-            .contains("mode\tcount")
-    );
+        let sidecar = PathBuf::from(format!("{}.{extension}", sketch_path.display()));
+        match extension {
+            "ull" => assert_eq!(dotani::utils::load_ull_sketch(&sidecar).unwrap().len(), 2),
+            "ell" => assert_eq!(dotani::utils::load_ell_sketch(&sidecar).unwrap().len(), 2),
+            _ => unreachable!(),
+        }
+
+        let ani_path = dir.path().join(format!("{extension}.tsv"));
+        let dist = run([
+            "dist",
+            "--path-r",
+            sketch_path.to_str().unwrap(),
+            "--path-q",
+            sketch_path.to_str().unwrap(),
+            "--out",
+            ani_path.to_str().unwrap(),
+            "--ani-th",
+            "0",
+            "--threads",
+            "1",
+            flag,
+        ]);
+        assert_success(&dist);
+        assert!(!fs::read_to_string(ani_path).unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -358,6 +361,60 @@ fn cli_rejects_conflicting_paths_and_invalid_values() {
         ]);
         assert_failure_contains(&cuda_ksize, "up to 32");
     }
+}
+
+#[test]
+fn valid_hv_dimensions_round_trip_and_count_output_mode() {
+    let dir = TestDir::new("roundtrip");
+    let inputs = dir.path().join("inputs");
+    fs::create_dir_all(&inputs).unwrap();
+    write_valid_fasta(&inputs);
+
+    for hv_d in ["256", "1024", "4096"] {
+        let output = dir.path().join(format!("{hv_d}.sketch"));
+        let sketch = run([
+            "sketch",
+            "--path",
+            inputs.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+            "--device",
+            "cpu",
+            "--ksize",
+            "3",
+            "--hv-d",
+            hv_d,
+            "--canonical",
+            "false",
+        ]);
+        assert_success(&sketch);
+        assert!(output.is_file());
+        assert!(PathBuf::from(format!("{}.ull", output.display())).is_file());
+    }
+
+    let output = dir.path().join("256.sketch");
+    let ani_output = dir.path().join("count.tsv");
+    let dist = run([
+        "dist",
+        "--path-r",
+        output.to_str().unwrap(),
+        "--path-q",
+        output.to_str().unwrap(),
+        "--out",
+        ani_output.to_str().unwrap(),
+        "--output-mode",
+        "count",
+        "--ani-th",
+        "0",
+        "--threads",
+        "1",
+    ]);
+    assert_success(&dist);
+    assert!(
+        fs::read_to_string(ani_output)
+            .unwrap()
+            .contains("mode\tcount")
+    );
 }
 
 #[test]
@@ -590,6 +647,60 @@ fn cpu_and_cuda_sketches_match_for_concurrent_files_and_dedup_strategies() {
                 assert_eq!(metric_counts(&cuda_metrics), cpu_metrics_counts);
             }
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cpu_and_cuda_ell_sketches_are_byte_identical_for_both_dedup_strategies() {
+    let dir = TestDir::new("cuda-ell-parity");
+    let inputs = dir.path().join("inputs");
+    fs::create_dir_all(&inputs).unwrap();
+    write_valid_fasta(&inputs);
+
+    let cpu_output = dir.path().join("cpu.sketch");
+    let cpu = run([
+        "sketch",
+        "--path",
+        inputs.to_str().unwrap(),
+        "--out",
+        cpu_output.to_str().unwrap(),
+        "--device",
+        "cpu",
+        "--ksize",
+        "3",
+        "--hv-d",
+        "256",
+        "--ell",
+    ]);
+    assert_success(&cpu);
+    let cpu_sketch = fs::read(&cpu_output).unwrap();
+    let cpu_ell = fs::read(format!("{}.ell", cpu_output.display())).unwrap();
+
+    for dedup in ["hashset", "sort_unstable"] {
+        let cuda_output = dir.path().join(format!("cuda-{dedup}.sketch"));
+        let cuda = run([
+            "sketch",
+            "--path",
+            inputs.to_str().unwrap(),
+            "--out",
+            cuda_output.to_str().unwrap(),
+            "--device",
+            "cuda",
+            "--cuda-dedup",
+            dedup,
+            "--ksize",
+            "3",
+            "--hv-d",
+            "256",
+            "--ell",
+        ]);
+        assert_success(&cuda);
+        assert_eq!(fs::read(&cuda_output).unwrap(), cpu_sketch);
+        assert_eq!(
+            fs::read(format!("{}.ell", cuda_output.display())).unwrap(),
+            cpu_ell
+        );
     }
 }
 
