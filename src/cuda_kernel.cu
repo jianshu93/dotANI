@@ -1,6 +1,31 @@
 #include "cuda_kernel.h"
 #include <stdint.h>
 
+static const uint64_t WY_P0 = UINT64_C(0xa0761d6478bd642f);
+static const uint64_t WY_P1 = UINT64_C(0xe7037ed1a0b428db);
+
+extern "C" __device__ __forceinline__ uint64_t wymum_u64(uint64_t a,
+                                                          uint64_t b) {
+  uint64_t high = __umul64hi(a, b);
+  uint64_t low = a * b;
+  return high ^ low;
+}
+
+extern "C" __device__ __forceinline__ uint64_t
+wyrng_at_chunk(uint64_t hash, int chunk) {
+  uint64_t state = hash + (((uint64_t)chunk + 1) * WY_P0);
+  return wymum_u64(state ^ WY_P1, state);
+}
+
+extern "C" __global__ void cuda_test_wyrng_at_chunk(const uint64_t *hashes,
+                                                     const int *chunks,
+                                                     uint64_t *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out[tid] = wyrng_at_chunk(hashes[tid], chunks[tid]);
+  }
+}
+
 extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   key = ~key + (key << 21);
   key = key ^ key >> 24;

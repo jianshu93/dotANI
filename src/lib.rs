@@ -16,8 +16,17 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use rand::{RngCore, SeedableRng};
+    use wyhash::WyRng;
+
     use crate::types::FileSketch;
     use crate::{dist, hd, utils};
+
+    #[cfg(feature = "cuda")]
+    const CUDA_KERNEL_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
+
+    const WY_P0: u64 = 0xa076_1d64_78bd_642f;
+    const WY_P1: u64 = 0xe703_7ed1_a0b4_28db;
 
     fn sketch_for_hv(hv_d: usize) -> FileSketch {
         FileSketch {
@@ -35,10 +44,106 @@ mod tests {
 
     fn fixed_hashes() -> HashSet<u64> {
         [
-            0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+            0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597,
         ]
         .into_iter()
         .collect()
+    }
+
+    fn test_wymum(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        ((product >> 64) ^ product) as u64
+    }
+
+    fn direct_seek_wyrng(hash: u64, chunk: usize) -> u64 {
+        let chunk_offset = (chunk as u64).wrapping_add(1).wrapping_mul(WY_P0);
+        let state = hash.wrapping_add(chunk_offset);
+        test_wymum(state ^ WY_P1, state)
+    }
+
+    fn representative_wyrng_hashes() -> [u64; 6] {
+        [
+            0,
+            1,
+            0x1234_5678_9abc_def0,
+            u64::MAX,
+            0x8000_0000_0000_0000,
+            0xfedc_ba98_7654_3210,
+        ]
+    }
+
+    fn representative_wyrng_chunks() -> [usize; 7] {
+        [0, 1, 63, 64, 127, (1024 / 64) - 1, (4096 / 64) - 1]
+    }
+
+    #[test]
+    fn wyrng_direct_seek_matches_sequential_chunks() {
+        let hashes = representative_wyrng_hashes();
+        let chunks = representative_wyrng_chunks();
+
+        for hash in hashes {
+            let max_chunk = chunks.iter().copied().max().unwrap();
+            let mut rng = WyRng::seed_from_u64(hash);
+            let sequential: Vec<u64> = (0..=max_chunk).map(|_| rng.next_u64()).collect();
+
+            for chunk in chunks {
+                assert_eq!(
+                    direct_seek_wyrng(hash, chunk),
+                    sequential[chunk],
+                    "direct seek mismatch for hash {hash:#018x}, chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_wyrng_direct_seek_matches_rust_wyrng() {
+        use cudarc::{
+            driver::{CudaContext, LaunchConfig, PushKernelArg},
+            nvrtc::Ptx,
+        };
+
+        let chunks = representative_wyrng_chunks();
+        let mut host_hashes = Vec::new();
+        let mut host_chunks = Vec::new();
+        let mut expected = Vec::new();
+
+        for hash in representative_wyrng_hashes() {
+            let max_chunk = chunks.iter().copied().max().unwrap();
+            let mut rng = WyRng::seed_from_u64(hash);
+            let sequential: Vec<u64> = (0..=max_chunk).map(|_| rng.next_u64()).collect();
+
+            for chunk in chunks {
+                host_hashes.push(hash);
+                host_chunks.push(chunk as i32);
+                expected.push(sequential[chunk]);
+            }
+        }
+
+        let ctx = CudaContext::new(0).unwrap();
+        let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_PTX)).unwrap();
+        let stream = ctx.default_stream();
+        let gpu_hashes = stream.clone_htod(&host_hashes).unwrap();
+        let gpu_chunks = stream.clone_htod(&host_chunks).unwrap();
+        let mut gpu_out = stream.alloc_zeros::<u64>(expected.len()).unwrap();
+
+        let f = module.load_function("cuda_test_wyrng_at_chunk").unwrap();
+        let mut builder = stream.launch_builder(&f);
+        builder.arg(&gpu_hashes);
+        builder.arg(&gpu_chunks);
+        builder.arg(&mut gpu_out);
+        let n_outputs = expected.len() as i32;
+        builder.arg(&n_outputs);
+
+        unsafe {
+            builder
+                .launch(LaunchConfig::for_num_elems(expected.len() as u32))
+                .unwrap();
+        }
+
+        let actual = stream.clone_dtoh(&gpu_out).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
