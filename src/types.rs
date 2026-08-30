@@ -84,6 +84,8 @@ pub struct CliParams {
     pub ull_out_file: PathBuf,
     pub path_ref_ull: PathBuf,
     pub path_query_ull: PathBuf,
+
+    pub metrics_out: Option<PathBuf>,
 }
 
 pub struct SketchParams {
@@ -103,6 +105,7 @@ pub struct SketchParams {
     pub if_ull: bool,
     pub ull_p: u32,
     pub ull_out_file: PathBuf,
+    pub metrics_out: Option<PathBuf>,
 }
 
 impl Default for SketchParams {
@@ -124,6 +127,7 @@ impl Default for SketchParams {
             if_ull: false,
             ull_p: 14,
             ull_out_file: PathBuf::new(),
+            metrics_out: None,
         }
     }
 }
@@ -147,9 +151,32 @@ impl SketchParams {
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;
         new_sketch.ull_out_file = params.ull_out_file.clone();
+        new_sketch.metrics_out = params.metrics_out.clone();
 
         new_sketch
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FileSketchMetrics {
+    pub file: String,
+    pub input_bases: usize,
+    pub hashes_seen: usize,
+    pub unique_hashes: usize,
+    pub fasta_ns: u128,
+    pub hash_and_dedup_ns: u128,
+    pub hd_encode_ns: u128,
+    pub hv_norm_ns: u128,
+    pub hd_compress_ns: u128,
+    pub total_worker_ns: u128,
+    pub sketch_wall_ns: Option<u128>,
+    pub cuda_stream_lane: Option<usize>,
+    pub cuda_h2d_ns: Option<u128>,
+    pub cuda_alloc_ns: Option<u128>,
+    pub cuda_launch_ns: Option<u128>,
+    pub cuda_d2h_ns: Option<u128>,
+    pub cuda_zero_filter_ns: Option<u128>,
+    pub cuda_filter_ns: Option<u128>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

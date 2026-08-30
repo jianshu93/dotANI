@@ -264,6 +264,104 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
     );
 }
 
+pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_wall_ns: u128) {
+    let summary_path = PathBuf::from(format!("{}.summary.tsv", prefix.to_string_lossy()));
+    let files_path = PathBuf::from(format!("{}.files.tsv", prefix.to_string_lossy()));
+
+    let mut files_tsv = String::new();
+    files_tsv.push_str(metrics_header());
+    files_tsv.push('\n');
+    for metric in metrics {
+        files_tsv.push_str(&metric_row(metric));
+        files_tsv.push('\n');
+    }
+    fs::write(&files_path, files_tsv).expect("Dump sketch file metrics failed!");
+
+    let mut summary = FileSketchMetrics::default();
+    summary.file = String::from("TOTAL");
+    summary.sketch_wall_ns = Some(sketch_wall_ns);
+    for metric in metrics {
+        summary.input_bases += metric.input_bases;
+        summary.hashes_seen += metric.hashes_seen;
+        summary.unique_hashes += metric.unique_hashes;
+        summary.fasta_ns += metric.fasta_ns;
+        summary.hash_and_dedup_ns += metric.hash_and_dedup_ns;
+        summary.hd_encode_ns += metric.hd_encode_ns;
+        summary.hv_norm_ns += metric.hv_norm_ns;
+        summary.hd_compress_ns += metric.hd_compress_ns;
+        summary.total_worker_ns += metric.total_worker_ns;
+        summary.cuda_h2d_ns = add_optional_ns(summary.cuda_h2d_ns, metric.cuda_h2d_ns);
+        summary.cuda_alloc_ns = add_optional_ns(summary.cuda_alloc_ns, metric.cuda_alloc_ns);
+        summary.cuda_launch_ns = add_optional_ns(summary.cuda_launch_ns, metric.cuda_launch_ns);
+        summary.cuda_d2h_ns = add_optional_ns(summary.cuda_d2h_ns, metric.cuda_d2h_ns);
+        summary.cuda_zero_filter_ns =
+            add_optional_ns(summary.cuda_zero_filter_ns, metric.cuda_zero_filter_ns);
+        summary.cuda_filter_ns = add_optional_ns(summary.cuda_filter_ns, metric.cuda_filter_ns);
+    }
+
+    let mut summary_tsv = String::new();
+    summary_tsv.push_str(metrics_header());
+    summary_tsv.push('\n');
+    summary_tsv.push_str(&metric_row(&summary));
+    summary_tsv.push('\n');
+    fs::write(&summary_path, summary_tsv).expect("Dump sketch summary metrics failed!");
+
+    info!(
+        "Wrote sketch metrics to {} and {}",
+        summary_path.display(),
+        files_path.display()
+    );
+}
+
+fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn metrics_header() -> &'static str {
+    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns"
+}
+
+fn metric_row(metric: &FileSketchMetrics) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        metric.file,
+        metric.input_bases,
+        metric.hashes_seen,
+        metric.unique_hashes,
+        metric.fasta_ns,
+        metric.hash_and_dedup_ns,
+        metric.hd_encode_ns,
+        metric.hv_norm_ns,
+        metric.hd_compress_ns,
+        metric.total_worker_ns,
+        optional_ns(metric.sketch_wall_ns),
+        optional_usize(metric.cuda_stream_lane),
+        optional_ns(metric.cuda_h2d_ns),
+        optional_ns(metric.cuda_alloc_ns),
+        optional_ns(metric.cuda_launch_ns),
+        optional_ns(metric.cuda_d2h_ns),
+        optional_ns(metric.cuda_zero_filter_ns),
+        optional_ns(metric.cuda_filter_ns)
+    )
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| String::from("NA"))
+}
+
+fn optional_ns(value: Option<u128>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| String::from("NA"))
+}
+
 pub fn load_ull_sketch(path: &Path) -> Vec<FileUllSketch> {
     info!("Loading ULL sketch from {}", path.to_str().unwrap());
     let bytes = fs::read(path).expect("Opening ULL sketch file failed!");

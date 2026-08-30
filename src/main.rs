@@ -6,7 +6,9 @@ use clap::{Arg, ArgAction, Command, value_parser};
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 
-use dotani::{dist, params, sketch, sketch_cuda, types};
+#[cfg(feature = "cuda")]
+use dotani::sketch_cuda;
+use dotani::{dist, params, sketch, types};
 
 fn init_log() {
     Builder::new()
@@ -35,6 +37,18 @@ fn default_threads_u8() -> u8 {
         .min(u8::MAX as usize) as u8
 }
 
+fn default_sketch_device() -> String {
+    if cuda_enabled() {
+        String::from("cuda")
+    } else {
+        String::from("cpu")
+    }
+}
+
+fn cuda_enabled() -> bool {
+    cfg!(feature = "cuda")
+}
+
 fn main() {
     init_log();
     println!("\n ************** initializing logger *****************\n");
@@ -59,6 +73,20 @@ fn main() {
                 .help("Input TSV manifest with read_path and file_id columns; row order is preserved; relative read_path values resolve against the current working directory")
                 .required_unless_present("path")
                 .conflicts_with("path")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("device")
+                .long("device")
+                .help("Sketch execution device. CUDA builds default to cuda; CPU-only builds default to cpu.")
+                .value_parser(["cpu", "cuda"])
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("metrics_out")
+                .long("metrics-out")
+                .help("Write sketch metrics to <prefix>.summary.tsv and <prefix>.files.tsv")
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
@@ -197,6 +225,16 @@ fn main() {
             .unwrap_or_else(|| default_threads_u8() as usize)
             .min(u8::MAX as usize) as u8;
 
+        let device = sketch_m
+            .get_one::<String>("device")
+            .cloned()
+            .unwrap_or_else(default_sketch_device);
+
+        if device == "cuda" && !cuda_enabled() {
+            eprintln!("error: --device cuda requires a binary built with --features cuda");
+            std::process::exit(2);
+        }
+
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
             path: sketch_m
@@ -217,12 +255,13 @@ fn main() {
             ani_threshold: 0.0,
             if_compressed: true,
             threads,
-            device: String::new(),
+            device,
             if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
             ull_out_file: ull_path_from_sketch_path(&out_file),
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
+            metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
         };
 
         rayon::ThreadPoolBuilder::new()
@@ -232,13 +271,18 @@ fn main() {
 
         let sketch_params = types::SketchParams::new(&cli_params);
 
-        #[cfg(feature = "cuda")]
-        {
-            sketch_cuda::sketch_cuda(sketch_params);
-        }
+        if sketch_params.device == "cuda" {
+            #[cfg(feature = "cuda")]
+            {
+                sketch_cuda::sketch_cuda(sketch_params);
+            }
 
-        #[cfg(not(feature = "cuda"))]
-        {
+            #[cfg(not(feature = "cuda"))]
+            {
+                eprintln!("error: --device cuda requires a binary built with --features cuda");
+                std::process::exit(2);
+            }
+        } else {
             sketch::sketch(sketch_params);
         }
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
@@ -273,6 +317,7 @@ fn main() {
             ull_out_file: PathBuf::new(),
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
+            metrics_out: None,
         };
 
         rayon::ThreadPoolBuilder::new()
