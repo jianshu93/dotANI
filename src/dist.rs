@@ -220,6 +220,9 @@ pub fn ani_from_intersection_and_cardinalities(
     card_q: f64,
     ksize: u8,
 ) -> f32 {
+    if ksize == 0 || !inter_hat.is_finite() || !card_r.is_finite() || !card_q.is_finite() {
+        return 0.0;
+    }
     if inter_hat <= 0.0 {
         return 0.0;
     }
@@ -230,8 +233,12 @@ pub fn ani_from_intersection_and_cardinalities(
     }
 
     let jaccard = inter_hat / union_hat;
-    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
+    if !jaccard.is_finite() || jaccard <= 0.0 {
         return 0.0;
+    }
+
+    if jaccard > 1.0 {
+        return 100.0;
     }
 
     let ani = (2.0 * jaccard as f32 / (1.0 + jaccard as f32)).powf(1.0 / ksize as f32);
@@ -665,3 +672,6 @@ pub fn compute_hv_ani(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
