@@ -5,7 +5,7 @@ use crate::types::*;
 use crate::utils;
 
 use anyhow::{Result, bail};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rayon::prelude::*;
 
 use std::fs::File;
@@ -35,19 +35,25 @@ pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
+    let ull_load_start = Instant::now();
     let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path())?;
     let query_ull_sketch = if if_sym {
         ref_ull_sketch.clone()
     } else {
         utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())?
     };
+    let ull_load_secs = ull_load_start.elapsed().as_secs_f32();
 
+    let sketch_load_start = Instant::now();
     let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path())?;
     let mut query_file_sketch = if if_sym {
         ref_file_sketch.clone()
     } else {
         utils::load_sketch(sketch_dist.path_query_sketch.as_path())?
     };
+    let sketch_load_secs = sketch_load_start.elapsed().as_secs_f32();
+
+    let validation_start = Instant::now();
 
     assert_eq!(
         ref_file_sketch.len(),
@@ -87,8 +93,14 @@ pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
         "Ref and query sketches use different HV dimensions!"
     );
 
+    let validation_secs = validation_start.elapsed().as_secs_f32();
+
+    let decompress_start = Instant::now();
     hd::decompress_file_sketch(&mut ref_file_sketch)?;
     hd::decompress_file_sketch(&mut query_file_sketch)?;
+    let decompress_secs = decompress_start.elapsed().as_secs_f32();
+
+    let compute_start = Instant::now();
 
     compute_hv_ani(
         sketch_dist,
@@ -99,12 +111,17 @@ pub fn dist(sketch_dist: &mut SketchDist) -> Result<()> {
         ksize_ref,
         if_sym,
     )?;
+    let compute_secs = compute_start.elapsed().as_secs_f32();
 
+    debug!(
+        "dist phase timings: ull_load={:.3}s sketch_load={:.3}s validation={:.3}s decompress={:.3}s compute_write={:.3}s",
+        ull_load_secs, sketch_load_secs, validation_secs, decompress_secs, compute_secs,
+    );
     info!(
-        "Computed ANIs for {} ref files and {} query files took {:.3}s",
+        "dist total={:.3}s refs={} queries={}",
+        tstart.elapsed().as_secs_f32(),
         ref_file_sketch.len(),
-        query_file_sketch.len(),
-        tstart.elapsed().as_secs_f32()
+        query_file_sketch.len()
     );
 
     Ok(())
@@ -299,7 +316,8 @@ fn stream_hv_ani_cpu(
         File::create(out_path).expect("Failed to create ANI output file"),
     )));
     let total_hits = AtomicUsize::new(0);
-    let debug_seen = AtomicUsize::new(0);
+    let total_ani_evals = AtomicUsize::new(0);
+    let total_nonpositive_skipped = AtomicUsize::new(0);
 
     let row_starts: Vec<usize> = (0..ref_filesketch.len()).step_by(ROW_BLOCK).collect();
 
@@ -309,6 +327,8 @@ fn stream_hv_ani_cpu(
         let mut local_text = String::with_capacity(1 << 20);
         let mut local_hits = 0usize;
         let mut local_pairs_done = 0usize;
+        let mut local_ani_evals = 0usize;
+        let mut local_nonpositive_skipped = 0usize;
 
         for i in i0..i1 {
             let j_start = if if_symmetric { i + 1 } else { 0 };
@@ -319,6 +339,13 @@ fn stream_hv_ani_cpu(
 
                 let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
                 let inter_hat = dot / r.hv_d as f64;
+                if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                    local_nonpositive_skipped += 1;
+                    local_pairs_done += 1;
+                    continue;
+                }
+
+                local_ani_evals += 1;
                 let ani = ani_from_intersection_and_cardinalities(
                     inter_hat,
                     ref_cards[i],
@@ -326,38 +353,12 @@ fn stream_hv_ani_cpu(
                     ksize,
                 );
 
-                let dbg_idx = debug_seen.fetch_add(1, Ordering::Relaxed);
-                if dbg_idx < 8 {
-                    let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
-                    let jaccard = if union_hat > 0.0 {
-                        inter_hat / union_hat
-                    } else {
-                        -1.0
-                    };
-
-                    info!(
-                        "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
-                        dbg_idx,
-                        r.file_str,
-                        q.file_str,
-                        ref_cards[i],
-                        query_cards[j],
-                        dot,
-                        inter_hat,
-                        union_hat,
-                        jaccard,
-                        ani
-                    );
-                }
-
                 if ani >= ani_threshold {
                     use std::fmt::Write as _;
                     let _ = writeln!(
                         &mut local_text,
                         "{}\t{}\t{:.3}",
-                        r.file_str,
-                        q.file_str,
-                        ani
+                        r.file_str, q.file_str, ani
                     );
                     local_hits += 1;
                 }
@@ -382,6 +383,8 @@ fn stream_hv_ani_cpu(
         }
 
         total_hits.fetch_add(local_hits, Ordering::Relaxed);
+        total_ani_evals.fetch_add(local_ani_evals, Ordering::Relaxed);
+        total_nonpositive_skipped.fetch_add(local_nonpositive_skipped, Ordering::Relaxed);
         pb.inc(local_pairs_done as u64);
     });
 
@@ -390,6 +393,13 @@ fn stream_hv_ani_cpu(
         .expect("ANI writer mutex poisoned")
         .flush()
         .expect("Failed to flush ANI output");
+
+    info!(
+        "cpu stream breakdown: hits={} ani_evals={} nonpositive_skipped={}",
+        total_hits.load(Ordering::Relaxed),
+        total_ani_evals.load(Ordering::Relaxed),
+        total_nonpositive_skipped.load(Ordering::Relaxed)
+    );
 
     total_hits.load(Ordering::Relaxed)
 }
@@ -408,6 +418,81 @@ struct TileBatchResult {
     text: String,
     num_hits: usize,
     num_pairs_done: usize,
+    candidate_pairs: usize,
+    prefilter_skipped: usize,
+    ani_evals: usize,
+    nonpositive_skipped: usize,
+    text_bytes: usize,
+    ref_flatten_events: usize,
+    flatten_ref_ns: u128,
+    flatten_query_ns: u128,
+    query_h2d_ns: u128,
+    ref_h2d_ns: u128,
+    compute_d2h_ns: u128,
+    gpu_tile_total_ns: u128,
+    postprocess_ns: u128,
+    query_h2d_bytes: usize,
+    ref_h2d_bytes: usize,
+    out_d2h_bytes: usize,
+    ref_uploads: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct GpuStreamBreakdown {
+    jobs: usize,
+    pairs: usize,
+    hits: usize,
+    candidates: usize,
+    prefilter_skipped: usize,
+    ani_evals: usize,
+    nonpositive_skipped: usize,
+    output_bytes: usize,
+    ref_flatten_events: usize,
+    flatten_ref_ns: u128,
+    flatten_query_ns: u128,
+    query_h2d_ns: u128,
+    ref_h2d_ns: u128,
+    compute_d2h_ns: u128,
+    gpu_tile_total_ns: u128,
+    postprocess_ns: u128,
+    write_ns: u128,
+    query_h2d_bytes: usize,
+    ref_h2d_bytes: usize,
+    out_d2h_bytes: usize,
+    ref_uploads: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuStreamBreakdown {
+    fn add_batch(&mut self, batch: &TileBatchResult) {
+        self.jobs += 1;
+        self.pairs += batch.num_pairs_done;
+        self.hits += batch.num_hits;
+        self.candidates += batch.candidate_pairs;
+        self.prefilter_skipped += batch.prefilter_skipped;
+        self.ani_evals += batch.ani_evals;
+        self.nonpositive_skipped += batch.nonpositive_skipped;
+        self.output_bytes += batch.text_bytes;
+        self.ref_flatten_events += batch.ref_flatten_events;
+        self.flatten_ref_ns += batch.flatten_ref_ns;
+        self.flatten_query_ns += batch.flatten_query_ns;
+        self.query_h2d_ns += batch.query_h2d_ns;
+        self.ref_h2d_ns += batch.ref_h2d_ns;
+        self.compute_d2h_ns += batch.compute_d2h_ns;
+        self.gpu_tile_total_ns += batch.gpu_tile_total_ns;
+        self.postprocess_ns += batch.postprocess_ns;
+        self.query_h2d_bytes += batch.query_h2d_bytes;
+        self.ref_h2d_bytes += batch.ref_h2d_bytes;
+        self.out_d2h_bytes += batch.out_d2h_bytes;
+        self.ref_uploads += batch.ref_uploads;
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn ns_to_secs(ns: u128) -> f64 {
+    ns as f64 / 1_000_000_000.0
 }
 
 #[cfg(feature = "cuda")]
@@ -449,7 +534,7 @@ fn stream_hv_ani_gpu_multi(
     let next = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
 
-    std::thread::scope(|scope| {
+    std::thread::scope(|scope| -> anyhow::Result<usize> {
         for dev_id in 0..ng {
             let tx = tx.clone();
             let jobs = Arc::clone(&jobs);
@@ -472,32 +557,43 @@ fn stream_hv_ani_gpu_multi(
 
                         let job = jobs[job_idx];
 
+                        let mut flatten_ref_ns = 0u128;
+                        let mut ref_flatten_events = 0usize;
                         if job.i0 != cached_i0 || job.i1 != cached_i1 {
                             cached_i0 = job.i0;
                             cached_i1 = job.i1;
 
                             let ref_block = &ref_filesketch[job.i0..job.i1];
                             cached_nr = ref_block.len();
+                            let flatten_ref_start = Instant::now();
                             cached_ref_flat = flatten_hv_matrix(ref_block);
+                            flatten_ref_ns = flatten_ref_start.elapsed().as_nanos();
+                            ref_flatten_events = 1;
                         }
 
                         let query_block = &query_filesketch[job.j0..job.j1];
                         let nq = query_block.len();
+                        let flatten_query_start = Instant::now();
                         let query_flat = flatten_hv_matrix(query_block);
+                        let flatten_query_ns = flatten_query_start.elapsed().as_nanos();
 
                         let mut tile_dots = vec![0i64; nq * cached_nr];
-                        gpu.compute_tile(
+                        let gpu_timings = gpu.compute_tile(
                             &query_flat,
                             nq,
                             &cached_ref_flat,
                             cached_nr,
                             hv_d,
                             &mut tile_dots,
+                            ref_flatten_events > 0,
                         )?;
 
+                        let postprocess_start = Instant::now();
                         let mut text = String::new();
                         let mut num_hits = 0usize;
                         let mut num_pairs_done = 0usize;
+                        let mut ani_evals = 0usize;
+                        let mut nonpositive_skipped = 0usize;
 
                         for q_local in 0..nq {
                             for r_local in 0..cached_nr {
@@ -512,6 +608,12 @@ fn stream_hv_ani_gpu_multi(
 
                                 let dot = tile_dots[q_local * cached_nr + r_local] as f64;
                                 let inter_hat = dot / hv_d as f64;
+                                if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                                    nonpositive_skipped += 1;
+                                    continue;
+                                }
+
+                                ani_evals += 1;
                                 let ani = ani_from_intersection_and_cardinalities(
                                     inter_hat,
                                     ref_cards[i],
@@ -532,13 +634,31 @@ fn stream_hv_ani_gpu_multi(
                                 }
                             }
                         }
+                        let postprocess_ns = postprocess_start.elapsed().as_nanos();
+                        let text_bytes = text.len();
 
-                        tx.send(Ok(TileBatchResult {
+                        let _ = tx.send(Ok(TileBatchResult {
                             text,
                             num_hits,
                             num_pairs_done,
-                        }))
-                        .expect("Failed to send tile batch result");
+                            candidate_pairs: num_pairs_done,
+                            prefilter_skipped: 0,
+                            ani_evals,
+                            nonpositive_skipped,
+                            text_bytes,
+                            ref_flatten_events,
+                            flatten_ref_ns,
+                            flatten_query_ns,
+                            query_h2d_ns: gpu_timings.query_h2d_ns,
+                            ref_h2d_ns: gpu_timings.ref_h2d_ns,
+                            compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                            gpu_tile_total_ns: gpu_timings.total_ns,
+                            postprocess_ns,
+                            query_h2d_bytes: gpu_timings.query_h2d_bytes,
+                            ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
+                            out_d2h_bytes: gpu_timings.out_d2h_bytes,
+                            ref_uploads: usize::from(gpu_timings.ref_upload_performed),
+                        }));
                     }
 
                     Ok(())
@@ -549,25 +669,72 @@ fn stream_hv_ani_gpu_multi(
                 }
             });
         }
-    });
 
-    drop(tx);
+        drop(tx);
 
-    let mut total_hits = 0usize;
-    for _ in 0..total_jobs {
-        match rx.recv().expect("GPU worker channel closed unexpectedly") {
-            Ok(batch) => {
-                writer
-                    .write_all(batch.text.as_bytes())
-                    .expect("Failed to write ANI batch");
-                total_hits += batch.num_hits;
-                pb.inc(batch.num_pairs_done as u64);
+        let mut total_hits = 0usize;
+        let mut received_jobs = 0usize;
+        let mut first_error = None;
+        let stream_wall_start = Instant::now();
+        let mut breakdown = GpuStreamBreakdown::default();
+
+        while received_jobs < total_jobs {
+            match rx.recv() {
+                Ok(Ok(batch)) => {
+                    received_jobs += 1;
+                    let write_start = Instant::now();
+                    writer
+                        .write_all(batch.text.as_bytes())
+                        .expect("Failed to write ANI batch");
+                    breakdown.write_ns += write_start.elapsed().as_nanos();
+                    total_hits += batch.num_hits;
+                    pb.inc(batch.num_pairs_done as u64);
+                    breakdown.add_batch(&batch);
+                }
+                Ok(Err(e)) => {
+                    first_error.get_or_insert(e);
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("GPU worker channel closed unexpectedly: {e}")
+                    });
+                    break;
+                }
             }
-            Err(e) => return Err(e),
         }
-    }
 
-    Ok(total_hits)
+        if let Some(e) = first_error {
+            Err(e)
+        } else {
+            // Worker timings are aggregate worker-sums; with multiple GPUs they can exceed wall.
+            info!(
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} output_mb={:.3} ref_flatten_events={} ref_uploads={} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
+                breakdown.jobs,
+                breakdown.pairs,
+                breakdown.hits,
+                breakdown.candidates,
+                breakdown.prefilter_skipped,
+                breakdown.ani_evals,
+                breakdown.nonpositive_skipped,
+                breakdown.output_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.ref_flatten_events,
+                breakdown.ref_uploads,
+                breakdown.query_h2d_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.ref_h2d_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.out_d2h_bytes as f64 / (1024.0 * 1024.0),
+                ns_to_secs(breakdown.flatten_ref_ns),
+                ns_to_secs(breakdown.flatten_query_ns),
+                ns_to_secs(breakdown.query_h2d_ns),
+                ns_to_secs(breakdown.ref_h2d_ns),
+                ns_to_secs(breakdown.compute_d2h_ns),
+                ns_to_secs(breakdown.gpu_tile_total_ns),
+                ns_to_secs(breakdown.postprocess_ns),
+                ns_to_secs(breakdown.write_ns),
+                stream_wall_start.elapsed().as_secs_f64(),
+            );
+            Ok(total_hits)
+        }
+    })
 }
 
 pub fn compute_hv_ani(
@@ -592,6 +759,8 @@ pub fn compute_hv_ani(
 
     let pb = utils::get_progress_bar(num_dists);
 
+    let compute_start = Instant::now();
+    let cardinality_start = Instant::now();
     let ref_cards: Vec<f64> = ref_ull_sketch
         .par_iter()
         .map(|s| ull_cardinality_from_state(&s.ull_state))
@@ -605,45 +774,51 @@ pub fn compute_hv_ani(
             .map(|s| ull_cardinality_from_state(&s.ull_state))
             .collect()
     };
+    let cardinality_secs = cardinality_start.elapsed().as_secs_f32();
 
-    let num_hits = {
-        #[cfg(feature = "cuda")]
-        {
-            let out_file = File::create(sketch_dist.out_file.as_path())
-                .expect("Failed to create ANI output file");
-            let mut writer = BufWriter::new(out_file);
+    let stream_start = Instant::now();
+    #[cfg(feature = "cuda")]
+    let (num_hits, output_open_secs, flush_secs, stream_mode) = {
+        let output_open_start = Instant::now();
+        let out_file =
+            File::create(sketch_dist.out_file.as_path()).expect("Failed to create ANI output file");
+        let mut writer = BufWriter::new(out_file);
+        let output_open_secs = output_open_start.elapsed().as_secs_f32();
 
-            let n = stream_hv_ani_gpu_multi(
-                &mut writer,
-                &pb,
-                ref_filesketch,
-                query_filesketch,
-                &ref_cards,
-                &query_cards,
-                ksize,
-                if_symmetric,
-                sketch_dist.ani_threshold,
-            )?;
-            writer.flush().expect("Failed to flush ANI output");
-            info!("Multi-GPU tiled dot-product completed successfully");
-            n
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            stream_hv_ani_cpu(
-                sketch_dist.out_file.as_path(),
-                &pb,
-                ref_filesketch,
-                query_filesketch,
-                &ref_cards,
-                &query_cards,
-                ksize,
-                if_symmetric,
-                sketch_dist.ani_threshold,
-            )
-        }
+        let n = stream_hv_ani_gpu_multi(
+            &mut writer,
+            &pb,
+            ref_filesketch,
+            query_filesketch,
+            &ref_cards,
+            &query_cards,
+            ksize,
+            if_symmetric,
+            sketch_dist.ani_threshold,
+        )?;
+        let flush_start = Instant::now();
+        writer.flush().expect("Failed to flush ANI output");
+        let flush_secs = flush_start.elapsed().as_secs_f32();
+        info!("Multi-GPU tiled dot-product completed successfully");
+        (n, output_open_secs, flush_secs, "gpu")
     };
+
+    #[cfg(not(feature = "cuda"))]
+    let (num_hits, output_open_secs, flush_secs, stream_mode) = {
+        let n = stream_hv_ani_cpu(
+            sketch_dist.out_file.as_path(),
+            &pb,
+            ref_filesketch,
+            query_filesketch,
+            &ref_cards,
+            &query_cards,
+            ksize,
+            if_symmetric,
+            sketch_dist.ani_threshold,
+        );
+        (n, 0.0, 0.0, "cpu")
+    };
+    let stream_secs = stream_start.elapsed().as_secs_f32();
 
     pb.finish_and_clear();
 
@@ -669,6 +844,20 @@ pub fn compute_hv_ani(
             sketch_dist.out_file.to_string_lossy()
         );
     }
+
+    let summary_start = Instant::now();
+    let summary_secs = summary_start.elapsed().as_secs_f32();
+
+    info!(
+        "compute_hv_ani timings: cardinality={:.3}s output_open={:.3}s stream_mode={} stream={:.3}s flush={:.3}s summary={:.3}s total={:.3}s",
+        cardinality_secs,
+        output_open_secs,
+        stream_mode,
+        stream_secs,
+        flush_secs,
+        summary_secs,
+        compute_start.elapsed().as_secs_f32()
+    );
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use cudarc::driver::{CudaContext, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use std::sync::Arc;
@@ -240,6 +240,18 @@ pub struct GpuDotExecutor {
     cap_out: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GpuTileTimings {
+    pub query_h2d_ns: u128,
+    pub ref_h2d_ns: u128,
+    pub compute_d2h_ns: u128,
+    pub total_ns: u128,
+    pub query_h2d_bytes: usize,
+    pub ref_h2d_bytes: usize,
+    pub out_d2h_bytes: usize,
+    pub ref_upload_performed: bool,
+}
+
 impl GpuDotExecutor {
     pub fn new(gpu_id: usize) -> Result<Self> {
         let t0 = Instant::now();
@@ -267,7 +279,7 @@ impl GpuDotExecutor {
         })
     }
 
-    fn ensure_query_capacity(&mut self, len: usize) -> Result<()> {
+    fn ensure_query_capacity(&mut self, len: usize) -> Result<bool> {
         if self.cap_query < len {
             let stream = self.ctx.default_stream();
             self.d_query = Some(stream.alloc_zeros::<i32>(len)?);
@@ -278,11 +290,12 @@ impl GpuDotExecutor {
                 len,
                 mib(len * std::mem::size_of::<i32>())
             );
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn ensure_ref_capacity(&mut self, len: usize) -> Result<()> {
+    fn ensure_ref_capacity(&mut self, len: usize) -> Result<bool> {
         if self.cap_ref < len {
             let stream = self.ctx.default_stream();
             self.d_ref = Some(stream.alloc_zeros::<i32>(len)?);
@@ -293,11 +306,12 @@ impl GpuDotExecutor {
                 len,
                 mib(len * std::mem::size_of::<i32>())
             );
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn ensure_out_capacity(&mut self, len: usize) -> Result<()> {
+    fn ensure_out_capacity(&mut self, len: usize) -> Result<bool> {
         if self.cap_out < len {
             let stream = self.ctx.default_stream();
             self.d_out = Some(stream.alloc_zeros::<i64>(len)?);
@@ -308,8 +322,9 @@ impl GpuDotExecutor {
                 len,
                 mib(len * std::mem::size_of::<i64>())
             );
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn compute_tile(
@@ -320,7 +335,8 @@ impl GpuDotExecutor {
         nr: usize,
         d: usize,
         out: &mut [i64],
-    ) -> Result<()> {
+        upload_ref: bool,
+    ) -> Result<GpuTileTimings> {
         if query_hv.len() != nq * d {
             bail!(
                 "query_hv length mismatch: got {}, expected {}",
@@ -336,7 +352,11 @@ impl GpuDotExecutor {
             );
         }
         if out.len() != nq * nr {
-            bail!("out length mismatch: got {}, expected {}", out.len(), nq * nr);
+            bail!(
+                "out length mismatch: got {}, expected {}",
+                out.len(),
+                nq * nr
+            );
         }
         if d == 0 {
             bail!("d must be > 0");
@@ -345,7 +365,7 @@ impl GpuDotExecutor {
         let t0 = Instant::now();
 
         self.ensure_query_capacity(query_hv.len())?;
-        self.ensure_ref_capacity(ref_hv.len())?;
+        let ref_capacity_grew = self.ensure_ref_capacity(ref_hv.len())?;
         self.ensure_out_capacity(out.len())?;
 
         let stream = self.ctx.default_stream();
@@ -367,12 +387,19 @@ impl GpuDotExecutor {
             .as_mut()
             .context("internal error: d_out missing after allocation")?;
 
-        // Reuse persistent buffers.
-        //
-        // If your cudarc version names these differently, the only thing you
-        // may need to adapt is these two H2D copies.
+        // Reuse persistent buffers. Ref upload is skipped on cache hits unless
+        // the device buffer grew and therefore cannot contain the cached tile.
+        let query_h2d_start = Instant::now();
         stream.memcpy_htod(query_hv, d_query)?;
-        stream.memcpy_htod(ref_hv, d_ref)?;
+        let query_h2d_ns = query_h2d_start.elapsed().as_nanos();
+
+        let ref_upload_performed = upload_ref || ref_capacity_grew;
+        let mut ref_h2d_ns = 0u128;
+        if ref_upload_performed {
+            let ref_h2d_start = Instant::now();
+            stream.memcpy_htod(ref_hv, d_ref)?;
+            ref_h2d_ns = ref_h2d_start.elapsed().as_nanos();
+        }
 
         const BLOCK_M: usize = 64;
         const BLOCK_N: usize = 32;
@@ -386,11 +413,7 @@ impl GpuDotExecutor {
         let smem_bytes = shared_mem_bytes_i32(BLOCK_M, BLOCK_N, BLOCK_K);
 
         let cfg = LaunchConfig {
-            grid_dim: (
-                nr.div_ceil(BLOCK_N) as u32,
-                nq.div_ceil(BLOCK_M) as u32,
-                1,
-            ),
+            grid_dim: (nr.div_ceil(BLOCK_N) as u32, nq.div_ceil(BLOCK_M) as u32, 1),
             block_dim: (BLK_X as u32, BLK_Y as u32, 1),
             shared_mem_bytes: smem_bytes,
         };
@@ -407,17 +430,22 @@ impl GpuDotExecutor {
         launch.arg(&d_i32);
         launch.arg(&mut *d_out);
 
+        let compute_d2h_start = Instant::now();
         unsafe { launch.launch(cfg) }?;
 
         // Fast common path: full-size tile matches current capacity.
+        let out_d2h_elems;
         if self.cap_out == out.len() {
             stream.memcpy_dtoh(d_out, out)?;
+            out_d2h_elems = out.len();
         } else {
             // Edge tiles: copy full persistent buffer to temp, then take prefix.
             let mut tmp = vec![0i64; self.cap_out];
             stream.memcpy_dtoh(d_out, &mut tmp)?;
             out.copy_from_slice(&tmp[..out.len()]);
+            out_d2h_elems = self.cap_out;
         }
+        let compute_d2h_ns = compute_d2h_start.elapsed().as_nanos();
 
         log::debug!(
             "GPU dot tile done on gpu_id={} nq={} nr={} d={} query={:.2} MiB ref={:.2} MiB out={:.2} MiB in {:.3}s",
@@ -431,6 +459,105 @@ impl GpuDotExecutor {
             t0.elapsed().as_secs_f64()
         );
 
-        Ok(())
+        Ok(GpuTileTimings {
+            query_h2d_ns,
+            ref_h2d_ns,
+            compute_d2h_ns,
+            total_ns: t0.elapsed().as_nanos(),
+            query_h2d_bytes: std::mem::size_of_val(query_hv),
+            ref_h2d_bytes: if ref_upload_performed {
+                std::mem::size_of_val(ref_hv)
+            } else {
+                0
+            },
+            out_d2h_bytes: out_d2h_elems * std::mem::size_of::<i64>(),
+            ref_upload_performed,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GpuDotExecutor;
+
+    fn compute(
+        gpu: &mut GpuDotExecutor,
+        query_hv: &[i32],
+        nq: usize,
+        ref_hv: &[i32],
+        nr: usize,
+        d: usize,
+        upload_ref: bool,
+    ) -> (Vec<i64>, super::GpuTileTimings) {
+        let mut out = vec![0i64; nq * nr];
+        let timings = gpu
+            .compute_tile(query_hv, nq, ref_hv, nr, d, &mut out, upload_ref)
+            .expect("GPU tile should compute");
+        (out, timings)
+    }
+
+    #[test]
+    fn compute_tile_upload_ref_true_matches_small_matrix() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let query = [1, 2, 3, 4, 0, 1];
+        let refs = [10, 0, 0, 0, 10, 0, 1, 1, 1];
+
+        let (out, timings) = compute(&mut gpu, &query, 2, &refs, 3, 3, true);
+
+        assert_eq!(out, vec![10, 20, 6, 40, 0, 5]);
+        assert!(timings.ref_upload_performed);
+        assert_eq!(
+            timings.query_h2d_bytes,
+            query.len() * std::mem::size_of::<i32>()
+        );
+        assert_eq!(
+            timings.ref_h2d_bytes,
+            refs.len() * std::mem::size_of::<i32>()
+        );
+        assert_eq!(
+            timings.out_d2h_bytes,
+            out.len() * std::mem::size_of::<i64>()
+        );
+    }
+
+    #[test]
+    fn compute_tile_upload_ref_false_reuses_previous_ref_with_new_query() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let refs = [1, 2, 3, 4];
+        let bogus_refs = [9, 9, 9, 9];
+
+        let (first, first_timings) = compute(&mut gpu, &[1, 0], 1, &refs, 2, 2, true);
+        let (second, second_timings) = compute(&mut gpu, &[0, 1], 1, &bogus_refs, 2, 2, false);
+
+        assert_eq!(first, vec![1, 3]);
+        assert_eq!(second, vec![2, 4]);
+        assert!(first_timings.ref_upload_performed);
+        assert!(!second_timings.ref_upload_performed);
+        assert_eq!(second_timings.ref_h2d_bytes, 0);
+    }
+
+    #[test]
+    fn compute_tile_upload_ref_true_replaces_previous_ref() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+
+        let (first, _) = compute(&mut gpu, &[1, 1], 1, &[1, 2, 3, 4], 2, 2, true);
+        let (second, timings) = compute(&mut gpu, &[1, 1], 1, &[5, 6, 7, 8], 2, 2, true);
+
+        assert_eq!(first, vec![3, 7]);
+        assert_eq!(second, vec![11, 15]);
+        assert!(timings.ref_upload_performed);
+    }
+
+    #[test]
+    fn compute_tile_forces_ref_upload_after_ref_capacity_grows() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+
+        let (first, _) = compute(&mut gpu, &[1, 0], 1, &[1, 2], 1, 2, true);
+        let (second, timings) = compute(&mut gpu, &[1, 0], 1, &[5, 6, 7, 8], 2, 2, false);
+
+        assert_eq!(first, vec![1]);
+        assert_eq!(second, vec![5, 7]);
+        assert!(timings.ref_upload_performed);
+        assert_eq!(timings.ref_h2d_bytes, 4 * std::mem::size_of::<i32>());
     }
 }
