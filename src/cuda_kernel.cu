@@ -83,11 +83,25 @@ extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   return key;
 }
 
+extern "C" __device__ __forceinline__ bool hash_passes_threshold(
+    uint64_t hash, uint64_t threshold) {
+  return threshold == UINT64_MAX || hash < threshold;
+}
+
+extern "C" __global__ void cuda_test_hash_threshold(
+    const uint64_t *hashes, const uint64_t *thresholds, uint8_t *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out[tid] = hash_passes_threshold(hashes[tid], thresholds[tid]) ? 1 : 0;
+  }
+}
+
 extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
     uint8_t *seq, const size_t n_bps, const size_t n_kmer_per_thread,
     const size_t n_hash_per_thread, const size_t ksize,
     const uint64_t threshold, const bool canonical,
-    const uint8_t *seq_nt4_table_ext, uint64_t *kmer_scaled_hash) {
+    const uint8_t *seq_nt4_table_ext, const size_t n_workers,
+    uint64_t *kmer_scaled_hash, uint32_t *kmer_hash_count) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
   // copy table to shared memory
@@ -97,13 +111,16 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
   }
   __syncthreads(); // wait for each thread to copy its elemenet
 
+  if ((size_t)tid >= n_workers)
+    return;
+
   // Each thread only processes n_kmer_thread kmers
   // BPs that each thread accesses
   size_t access_per_thread = n_kmer_per_thread + ksize - 1;
 
   // Each kmer starts from (tid) to () in the seq
   uint64_t cur_kmer_fwd = 0, cur_kmer_rev = 0;
-  uint64_t mask = (1ULL << (ksize * 2)) - 1;
+  uint64_t mask = ksize >= 32 ? UINT64_MAX : (1ULL << (ksize * 2)) - 1;
   uint64_t kmer_hash;
   size_t shift = (ksize - 1) * 2;
 
@@ -129,7 +146,8 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
             kmer_hash = mmhash_u64(cur_kmer_fwd);
           }
 
-          if (kmer_hash < threshold && cnt < n_hash_per_thread)
+          if (hash_passes_threshold(kmer_hash, threshold) &&
+              cnt < n_hash_per_thread)
             kmer_scaled_hash[tid * n_hash_per_thread + (cnt++)] = kmer_hash;
         }
       } else {
@@ -137,6 +155,7 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
       }
     }
   }
+  kmer_hash_count[tid] = (uint32_t)cnt;
 }
 
 static const uint64_t prime_0 = UINT64_C(0xEC99BF0D8372CAAB);
@@ -154,9 +173,12 @@ typedef struct {
 
 extern "C" __device__ int64_t strcmp_l(const uint8_t *s1, const uint8_t *s2,
                                        const size_t length) {
-  for (size_t i = 0; i < length && *s1 == *s2; i++, ++s1, ++s2) {
+  for (size_t i = 0; i < length; i++, ++s1, ++s2) {
+    if (*s1 != *s2) {
+      return *s1 < *s2 ? -1 : 1;
+    }
   }
-  return *s1 < *s2 ? -1 : 1;
+  return 0;
 }
 
 extern "C" __device__ static inline uint64_t rot64(uint64_t v, unsigned s) {
@@ -323,9 +345,13 @@ cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
                 const size_t n_kmer_per_thread, const size_t n_hash_per_thread,
                 const size_t ksize, const uint64_t threshold,
                 const uint64_t seed, const bool canonical,
-                uint64_t *kmer_scaled_hash) {
+                const size_t n_workers, uint64_t *kmer_scaled_hash,
+                uint32_t *kmer_hash_count) {
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if ((size_t)tid >= n_workers)
+    return;
 
   // Each thread only processes n_kmer_thread kmers
   // BPs that each thread accesses
@@ -384,9 +410,11 @@ cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
           kmer_hash = t1ha2_atonce(ptr_fwd, ksize, seed);
         }
 
-        if (cnt_hash < n_hash_per_thread && kmer_hash < threshold)
+        if (cnt_hash < n_hash_per_thread &&
+            hash_passes_threshold(kmer_hash, threshold))
           kmer_scaled_hash[tid * n_hash_per_thread + (cnt_hash++)] = kmer_hash;
       }
     }
   }
+  kmer_hash_count[tid] = (uint32_t)cnt_hash;
 }

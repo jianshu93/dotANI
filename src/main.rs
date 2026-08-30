@@ -30,11 +30,20 @@ fn ull_path_from_sketch_path(p: &PathBuf) -> PathBuf {
     PathBuf::from(format!("{}.ull", p.to_string_lossy()))
 }
 
-fn default_threads_u8() -> u8 {
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{value:?} is not a valid positive integer"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
+fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(u8::MAX as usize) as u8
 }
 
 fn default_sketch_device() -> String {
@@ -84,10 +93,25 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("cuda_dedup")
+                .long("cuda-dedup")
+                .help("CUDA host-side dedup strategy")
+                .default_value("sort_unstable")
+                .value_parser(["hashset", "sort_unstable"])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("metrics_out")
                 .long("metrics-out")
                 .help("Write sketch metrics to <prefix>.summary.tsv and <prefix>.files.tsv")
                 .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("max_readers")
+                .long("max-readers")
+                .help("CUDA only: maximum concurrent FASTA read/decompress/merge workers")
+                .value_parser(parse_positive_usize)
                 .action(ArgAction::Set),
         )
         .arg(
@@ -222,8 +246,7 @@ fn main() {
         let threads = sketch_m
             .get_one::<usize>("threads")
             .copied()
-            .unwrap_or_else(|| default_threads_u8() as usize)
-            .min(u8::MAX as usize) as u8;
+            .unwrap_or_else(default_threads);
 
         let device = sketch_m
             .get_one::<String>("device")
@@ -232,6 +255,10 @@ fn main() {
 
         if device == "cuda" && !cuda_enabled() {
             eprintln!("error: --device cuda requires a binary built with --features cuda");
+            std::process::exit(2);
+        }
+        if device == "cpu" && sketch_m.contains_id("max_readers") {
+            eprintln!("error: --max-readers is only supported with --device cuda");
             std::process::exit(2);
         }
 
@@ -255,6 +282,12 @@ fn main() {
             ani_threshold: 0.0,
             if_compressed: true,
             threads,
+            cuda_dedup_strategy: types::CudaDedupStrategy::from_cli_value(
+                sketch_m
+                    .get_one::<String>("cuda_dedup")
+                    .expect("clap guarantees cuda-dedup has default"),
+            ),
+            max_readers: sketch_m.get_one::<usize>("max_readers").copied(),
             device,
             if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -291,8 +324,7 @@ fn main() {
         let threads = dist_m
             .get_one::<usize>("threads")
             .copied()
-            .unwrap_or_else(|| default_threads_u8() as usize)
-            .min(u8::MAX as usize) as u8;
+            .unwrap_or_else(default_threads);
 
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
@@ -311,6 +343,8 @@ fn main() {
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads,
+            cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
+            max_readers: None,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,

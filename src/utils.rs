@@ -1,7 +1,7 @@
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -264,7 +264,11 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
     );
 }
 
-pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_wall_ns: u128) {
+pub fn dump_sketch_metrics(
+    metrics: &[FileSketchMetrics],
+    prefix: &Path,
+    sketch_wall_ns: u128,
+) -> Result<()> {
     let summary_path = PathBuf::from(format!("{}.summary.tsv", prefix.to_string_lossy()));
     let files_path = PathBuf::from(format!("{}.files.tsv", prefix.to_string_lossy()));
 
@@ -275,7 +279,12 @@ pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_
         files_tsv.push_str(&metric_row(metric));
         files_tsv.push('\n');
     }
-    fs::write(&files_path, files_tsv).expect("Dump sketch file metrics failed!");
+    fs::write(&files_path, files_tsv).with_context(|| {
+        format!(
+            "failed to write sketch file metrics {}",
+            files_path.display()
+        )
+    })?;
 
     let mut summary = FileSketchMetrics::default();
     summary.file = String::from("TOTAL");
@@ -285,29 +294,49 @@ pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_
         summary.hashes_seen += metric.hashes_seen;
         summary.unique_hashes += metric.unique_hashes;
         summary.fasta_ns += metric.fasta_ns;
+        summary.fasta_wait_ns += metric.fasta_wait_ns;
         summary.hash_and_dedup_ns += metric.hash_and_dedup_ns;
         summary.hd_encode_ns += metric.hd_encode_ns;
         summary.hv_norm_ns += metric.hv_norm_ns;
         summary.hd_compress_ns += metric.hd_compress_ns;
         summary.total_worker_ns += metric.total_worker_ns;
         summary.cuda_h2d_ns = add_optional_ns(summary.cuda_h2d_ns, metric.cuda_h2d_ns);
+        summary.cuda_h2d_event_ns =
+            add_optional_ns(summary.cuda_h2d_event_ns, metric.cuda_h2d_event_ns);
         summary.cuda_alloc_ns = add_optional_ns(summary.cuda_alloc_ns, metric.cuda_alloc_ns);
         summary.cuda_launch_ns = add_optional_ns(summary.cuda_launch_ns, metric.cuda_launch_ns);
+        summary.cuda_kernel_event_ns =
+            add_optional_ns(summary.cuda_kernel_event_ns, metric.cuda_kernel_event_ns);
         summary.cuda_d2h_ns = add_optional_ns(summary.cuda_d2h_ns, metric.cuda_d2h_ns);
-        summary.cuda_zero_filter_ns =
-            add_optional_ns(summary.cuda_zero_filter_ns, metric.cuda_zero_filter_ns);
+        summary.cuda_d2h_event_ns =
+            add_optional_ns(summary.cuda_d2h_event_ns, metric.cuda_d2h_event_ns);
+        summary.cuda_compact_ns = add_optional_ns(summary.cuda_compact_ns, metric.cuda_compact_ns);
         summary.cuda_filter_ns = add_optional_ns(summary.cuda_filter_ns, metric.cuda_filter_ns);
         summary.cuda_hd_hash_h2d_ns =
             add_optional_ns(summary.cuda_hd_hash_h2d_ns, metric.cuda_hd_hash_h2d_ns);
+        summary.cuda_hd_hash_h2d_event_ns = add_optional_ns(
+            summary.cuda_hd_hash_h2d_event_ns,
+            metric.cuda_hd_hash_h2d_event_ns,
+        );
         summary.cuda_hd_hv_h2d_ns =
             add_optional_ns(summary.cuda_hd_hv_h2d_ns, metric.cuda_hd_hv_h2d_ns);
+        summary.cuda_hd_hv_h2d_event_ns = add_optional_ns(
+            summary.cuda_hd_hv_h2d_event_ns,
+            metric.cuda_hd_hv_h2d_event_ns,
+        );
         summary.cuda_hd_alloc_ns =
             add_optional_ns(summary.cuda_hd_alloc_ns, metric.cuda_hd_alloc_ns);
         summary.cuda_hd_kernel_launch_ns = add_optional_ns(
             summary.cuda_hd_kernel_launch_ns,
             metric.cuda_hd_kernel_launch_ns,
         );
+        summary.cuda_hd_kernel_event_ns = add_optional_ns(
+            summary.cuda_hd_kernel_event_ns,
+            metric.cuda_hd_kernel_event_ns,
+        );
         summary.cuda_hd_d2h_ns = add_optional_ns(summary.cuda_hd_d2h_ns, metric.cuda_hd_d2h_ns);
+        summary.cuda_hd_d2h_event_ns =
+            add_optional_ns(summary.cuda_hd_d2h_event_ns, metric.cuda_hd_d2h_event_ns);
     }
 
     let mut summary_tsv = String::new();
@@ -315,13 +344,19 @@ pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_
     summary_tsv.push('\n');
     summary_tsv.push_str(&metric_row(&summary));
     summary_tsv.push('\n');
-    fs::write(&summary_path, summary_tsv).expect("Dump sketch summary metrics failed!");
+    fs::write(&summary_path, summary_tsv).with_context(|| {
+        format!(
+            "failed to write sketch summary metrics {}",
+            summary_path.display()
+        )
+    })?;
 
     info!(
         "Wrote sketch metrics to {} and {}",
         summary_path.display(),
         files_path.display()
     );
+    Ok(())
 }
 
 fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
@@ -334,36 +369,45 @@ fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
 }
 
 fn metrics_header() -> &'static str {
-    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
+    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\tfasta_wait_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_h2d_event_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_kernel_event_ns\tcuda_d2h_ns\tcuda_d2h_event_ns\tcuda_compact_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hash_h2d_event_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_hv_h2d_event_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_kernel_event_ns\tcuda_hd_d2h_ns\tcuda_hd_d2h_event_ns"
 }
 
 fn metric_row(metric: &FileSketchMetrics) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        metric.file,
-        metric.input_bases,
-        metric.hashes_seen,
-        metric.unique_hashes,
-        metric.fasta_ns,
-        metric.hash_and_dedup_ns,
-        metric.hd_encode_ns,
-        metric.hv_norm_ns,
-        metric.hd_compress_ns,
-        metric.total_worker_ns,
+    [
+        metric.file.clone(),
+        metric.input_bases.to_string(),
+        metric.hashes_seen.to_string(),
+        metric.unique_hashes.to_string(),
+        metric.fasta_ns.to_string(),
+        metric.fasta_wait_ns.to_string(),
+        metric.hash_and_dedup_ns.to_string(),
+        metric.hd_encode_ns.to_string(),
+        metric.hv_norm_ns.to_string(),
+        metric.hd_compress_ns.to_string(),
+        metric.total_worker_ns.to_string(),
         optional_ns(metric.sketch_wall_ns),
         optional_usize(metric.cuda_stream_lane),
+        optional_usize(metric.cuda_device_id),
         optional_ns(metric.cuda_h2d_ns),
+        optional_ns(metric.cuda_h2d_event_ns),
         optional_ns(metric.cuda_alloc_ns),
         optional_ns(metric.cuda_launch_ns),
+        optional_ns(metric.cuda_kernel_event_ns),
         optional_ns(metric.cuda_d2h_ns),
-        optional_ns(metric.cuda_zero_filter_ns),
+        optional_ns(metric.cuda_d2h_event_ns),
+        optional_ns(metric.cuda_compact_ns),
         optional_ns(metric.cuda_filter_ns),
         optional_ns(metric.cuda_hd_hash_h2d_ns),
+        optional_ns(metric.cuda_hd_hash_h2d_event_ns),
         optional_ns(metric.cuda_hd_hv_h2d_ns),
+        optional_ns(metric.cuda_hd_hv_h2d_event_ns),
         optional_ns(metric.cuda_hd_alloc_ns),
         optional_ns(metric.cuda_hd_kernel_launch_ns),
-        optional_ns(metric.cuda_hd_d2h_ns)
-    )
+        optional_ns(metric.cuda_hd_kernel_event_ns),
+        optional_ns(metric.cuda_hd_d2h_ns),
+        optional_ns(metric.cuda_hd_d2h_event_ns),
+    ]
+    .join("\t")
 }
 
 fn optional_usize(value: Option<usize>) -> String {

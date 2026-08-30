@@ -136,14 +136,32 @@ fn extract_kmer_hash_and_ull(
         metrics.fasta_ns += start.elapsed().as_nanos();
 
         let start = Instant::now();
-        for (_, kmer, _) in norm_seq.canonical_kmers(ksize, &rc) {
-            let h = t1ha::t1ha2_atonce(kmer, seed);
+        if sketch.canonical {
+            for (_, kmer, _) in norm_seq.canonical_kmers(ksize, &rc) {
+                let h = t1ha::t1ha2_atonce(kmer, seed);
 
-            // ULL tracks the full hashed k-mer stream
-            ull.add(h);
-            metrics.hashes_seen += 1;
-            // dothash tracks all hashed kmers
-            hash_set.insert(h);
+                // ULL tracks the full hashed k-mer stream
+                ull.add(h);
+                metrics.hashes_seen += 1;
+                // dothash tracks all hashed kmers
+                hash_set.insert(h);
+            }
+        } else {
+            for kmer in norm_seq.kmers(ksize) {
+                if !kmer
+                    .iter()
+                    .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
+                {
+                    continue;
+                }
+                let h = t1ha::t1ha2_atonce(kmer, seed);
+
+                // ULL tracks the full hashed k-mer stream
+                ull.add(h);
+                metrics.hashes_seen += 1;
+                // dothash tracks all hashed kmers
+                hash_set.insert(h);
+            }
         }
         metrics.hash_and_dedup_ns += start.elapsed().as_nanos();
     }

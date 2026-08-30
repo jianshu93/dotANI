@@ -21,6 +21,7 @@ indicatif = "0.17.7"
 clap = { version = "4.4.6", features = ["cargo"] }
 serde = { version = "1.0.193", features = ["derive"] }
 anyhow = "1"
+crossbeam-channel = "0.5"
 zstd = { version = "0.13", features = ["zstdmt"] }
 cudarc = { version = "0.19.4", features = [
     "driver",

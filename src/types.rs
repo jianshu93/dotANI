@@ -77,7 +77,9 @@ pub struct CliParams {
     pub ani_threshold: f32,
     pub if_compressed: bool,
 
-    pub threads: u8,
+    pub threads: usize,
+    pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -101,6 +103,9 @@ pub struct SketchParams {
     pub hv_d: usize,
     pub hv_quant_scale: f32,
     pub if_compressed: bool,
+    pub threads: usize,
+    pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -123,6 +128,9 @@ impl Default for SketchParams {
             hv_d: 4096,
             hv_quant_scale: 1.0,
             if_compressed: true,
+            threads: 1,
+            cuda_dedup_strategy: CudaDedupStrategy::SortUnstable,
+            max_readers: None,
 
             if_ull: false,
             ull_p: 14,
@@ -147,6 +155,9 @@ impl SketchParams {
         new_sketch.hv_d = params.hv_d;
         new_sketch.hv_quant_scale = params.hv_quant_scale;
         new_sketch.if_compressed = params.if_compressed;
+        new_sketch.threads = params.threads;
+        new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
+        new_sketch.max_readers = params.max_readers;
 
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;
@@ -164,6 +175,7 @@ pub struct FileSketchMetrics {
     pub hashes_seen: usize,
     pub unique_hashes: usize,
     pub fasta_ns: u128,
+    pub fasta_wait_ns: u128,
     pub hash_and_dedup_ns: u128,
     pub hd_encode_ns: u128,
     pub hv_norm_ns: u128,
@@ -171,17 +183,48 @@ pub struct FileSketchMetrics {
     pub total_worker_ns: u128,
     pub sketch_wall_ns: Option<u128>,
     pub cuda_stream_lane: Option<usize>,
+    pub cuda_device_id: Option<usize>,
     pub cuda_h2d_ns: Option<u128>,
+    pub cuda_h2d_event_ns: Option<u128>,
     pub cuda_alloc_ns: Option<u128>,
     pub cuda_launch_ns: Option<u128>,
+    pub cuda_kernel_event_ns: Option<u128>,
     pub cuda_d2h_ns: Option<u128>,
-    pub cuda_zero_filter_ns: Option<u128>,
+    pub cuda_d2h_event_ns: Option<u128>,
+    pub cuda_compact_ns: Option<u128>,
     pub cuda_filter_ns: Option<u128>,
     pub cuda_hd_hash_h2d_ns: Option<u128>,
+    pub cuda_hd_hash_h2d_event_ns: Option<u128>,
     pub cuda_hd_hv_h2d_ns: Option<u128>,
+    pub cuda_hd_hv_h2d_event_ns: Option<u128>,
     pub cuda_hd_alloc_ns: Option<u128>,
     pub cuda_hd_kernel_launch_ns: Option<u128>,
+    pub cuda_hd_kernel_event_ns: Option<u128>,
     pub cuda_hd_d2h_ns: Option<u128>,
+    pub cuda_hd_d2h_event_ns: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaDedupStrategy {
+    HashSet,
+    SortUnstable,
+}
+
+impl CudaDedupStrategy {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "hashset" => Self::HashSet,
+            "sort_unstable" => Self::SortUnstable,
+            _ => panic!("invalid CUDA dedup strategy {value:?}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HashSet => "hashset",
+            Self::SortUnstable => "sort_unstable",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
