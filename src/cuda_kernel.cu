@@ -1,6 +1,77 @@
 #include "cuda_kernel.h"
 #include <stdint.h>
 
+static const uint64_t WY_P0 = UINT64_C(0xa0761d6478bd642f);
+static const uint64_t WY_P1 = UINT64_C(0xe7037ed1a0b428db);
+
+extern "C" __device__ __forceinline__ uint64_t wymum_u64(uint64_t a,
+                                                          uint64_t b) {
+  uint64_t high = __umul64hi(a, b);
+  uint64_t low = a * b;
+  return high ^ low;
+}
+
+extern "C" __device__ __forceinline__ uint64_t
+wyrng_at_chunk(uint64_t hash, int chunk) {
+  uint64_t state = hash + (((uint64_t)chunk + 1) * WY_P0);
+  return wymum_u64(state ^ WY_P1, state);
+}
+
+extern "C" __global__ void cuda_test_wyrng_at_chunk(const uint64_t *hashes,
+                                                     const int *chunks,
+                                                     uint64_t *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out[tid] = wyrng_at_chunk(hashes[tid], chunks[tid]);
+  }
+}
+
+extern "C" __global__ void
+cuda_hd_encode_counts_direct(const uint64_t *hashes, int num_hashes, int hv_d,
+                             int32_t *hv) {
+  int chunk = blockIdx.x;
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+  int hash_idx = blockIdx.y * blockDim.x + tid;
+
+  __shared__ int warp_counts[8][64];
+
+  for (int i = tid; i < num_warps * 64; i += blockDim.x) {
+    warp_counts[i / 64][i % 64] = 0;
+  }
+  __syncthreads();
+
+  uint64_t rnd = 0;
+  bool active = false;
+  if (hash_idx < num_hashes) {
+    rnd = wyrng_at_chunk(hashes[hash_idx], chunk);
+    active = true;
+  }
+
+  for (int bit = 0; bit < 64; bit++) {
+    unsigned int bit_mask =
+        __ballot_sync(0xffffffff, active && ((rnd >> bit) & 1ULL));
+    if (lane == 0) {
+      warp_counts[warp][bit] = __popc(bit_mask);
+    }
+  }
+
+  __syncthreads();
+
+  if (tid < 64) {
+    int d = chunk * 64 + tid;
+    if (d < hv_d) {
+      int ones = 0;
+      for (int w = 0; w < num_warps; w++) {
+        ones += warp_counts[w][tid];
+      }
+      atomicAdd(&hv[d], ones * 2);
+    }
+  }
+}
+
 extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   key = ~key + (key << 21);
   key = key ^ key >> 24;
@@ -12,11 +83,25 @@ extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   return key;
 }
 
+extern "C" __device__ __forceinline__ bool hash_passes_threshold(
+    uint64_t hash, uint64_t threshold) {
+  return threshold == UINT64_MAX || hash < threshold;
+}
+
+extern "C" __global__ void cuda_test_hash_threshold(
+    const uint64_t *hashes, const uint64_t *thresholds, uint8_t *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out[tid] = hash_passes_threshold(hashes[tid], thresholds[tid]) ? 1 : 0;
+  }
+}
+
 extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
     uint8_t *seq, const size_t n_bps, const size_t n_kmer_per_thread,
     const size_t n_hash_per_thread, const size_t ksize,
     const uint64_t threshold, const bool canonical,
-    const uint8_t *seq_nt4_table_ext, uint64_t *kmer_scaled_hash) {
+    const uint8_t *seq_nt4_table_ext, const size_t n_workers,
+    uint64_t *kmer_scaled_hash, uint32_t *kmer_hash_count) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
   // copy table to shared memory
@@ -26,13 +111,16 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
   }
   __syncthreads(); // wait for each thread to copy its elemenet
 
+  if ((size_t)tid >= n_workers)
+    return;
+
   // Each thread only processes n_kmer_thread kmers
   // BPs that each thread accesses
   size_t access_per_thread = n_kmer_per_thread + ksize - 1;
 
   // Each kmer starts from (tid) to () in the seq
   uint64_t cur_kmer_fwd = 0, cur_kmer_rev = 0;
-  uint64_t mask = (1ULL << (ksize * 2)) - 1;
+  uint64_t mask = ksize >= 32 ? UINT64_MAX : (1ULL << (ksize * 2)) - 1;
   uint64_t kmer_hash;
   size_t shift = (ksize - 1) * 2;
 
@@ -58,7 +146,8 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
             kmer_hash = mmhash_u64(cur_kmer_fwd);
           }
 
-          if (kmer_hash < threshold && cnt < n_hash_per_thread)
+          if (hash_passes_threshold(kmer_hash, threshold) &&
+              cnt < n_hash_per_thread)
             kmer_scaled_hash[tid * n_hash_per_thread + (cnt++)] = kmer_hash;
         }
       } else {
@@ -66,6 +155,7 @@ extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
       }
     }
   }
+  kmer_hash_count[tid] = (uint32_t)cnt;
 }
 
 static const uint64_t prime_0 = UINT64_C(0xEC99BF0D8372CAAB);
@@ -83,9 +173,12 @@ typedef struct {
 
 extern "C" __device__ int64_t strcmp_l(const uint8_t *s1, const uint8_t *s2,
                                        const size_t length) {
-  for (size_t i = 0; i < length && *s1 == *s2; i++, ++s1, ++s2) {
+  for (size_t i = 0; i < length; i++, ++s1, ++s2) {
+    if (*s1 != *s2) {
+      return *s1 < *s2 ? -1 : 1;
+    }
   }
-  return *s1 < *s2 ? -1 : 1;
+  return 0;
 }
 
 extern "C" __device__ static inline uint64_t rot64(uint64_t v, unsigned s) {
@@ -252,9 +345,13 @@ cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
                 const size_t n_kmer_per_thread, const size_t n_hash_per_thread,
                 const size_t ksize, const uint64_t threshold,
                 const uint64_t seed, const bool canonical,
-                uint64_t *kmer_scaled_hash) {
+                const size_t n_workers, uint64_t *kmer_scaled_hash,
+                uint32_t *kmer_hash_count) {
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if ((size_t)tid >= n_workers)
+    return;
 
   // Each thread only processes n_kmer_thread kmers
   // BPs that each thread accesses
@@ -313,9 +410,11 @@ cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
           kmer_hash = t1ha2_atonce(ptr_fwd, ksize, seed);
         }
 
-        if (cnt_hash < n_hash_per_thread && kmer_hash < threshold)
+        if (cnt_hash < n_hash_per_thread &&
+            hash_passes_threshold(kmer_hash, threshold))
           kmer_scaled_hash[tid * n_hash_per_thread + (cnt_hash++)] = kmer_hash;
       }
     }
   }
+  kmer_hash_count[tid] = (uint32_t)cnt_hash;
 }

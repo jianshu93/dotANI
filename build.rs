@@ -57,8 +57,7 @@ fn main() {
     let generated_bindings = bindings.to_string();
 
     let pointer_regex = Regex::new(r"\*mut f32").expect("Failed to compile regex");
-    let modified_bindings =
-        pointer_regex.replace_all(&generated_bindings, "CudaSlice<f32>");
+    let modified_bindings = pointer_regex.replace_all(&generated_bindings, "CudaSlice<f32>");
 
     std::fs::write(out_dir.join("bindings.rs"), modified_bindings.as_bytes())
         .expect("Failed to write bindings");
