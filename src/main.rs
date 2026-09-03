@@ -97,7 +97,7 @@ fn parse_ani_threshold(value: &str) -> Result<f32, String> {
 
 fn run() -> Result<()> {
     let sketch_cmd = Command::new(params::CMD_SKETCH)
-        .version("0.3.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("Sketch genome FASTA files into DotHash and ULL or ELL sketches")
         .arg(
             Arg::new("path")
@@ -327,7 +327,7 @@ fn run() -> Result<()> {
         );
 
     let matches = Command::new("dotani")
-        .version(params::VERSION)
+        .version(env!("CARGO_PKG_VERSION"))
         .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and ULL or ELL, with GPU acceleration")
         .arg_required_else_help(true)
         .subcommand_required(true)
